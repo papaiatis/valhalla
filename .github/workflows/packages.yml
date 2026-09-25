@@ -1,0 +1,83 @@
+name: packages
+
+# Builds the fork and runs the routing package tests (PackageSet, mjolnir.packages): once in a
+# release build, once under ThreadSanitizer, as package sets are shared by every thread.
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "*-pkg.*"
+    paths-ignore:
+      - "*.md"
+      - docs/
+      - run_route_scripts/
+      - test_requests/
+  pull_request:
+    paths-ignore:
+      - "*.md"
+      - docs/
+      - run_route_scripts/
+      - test_requests/
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package_tests:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            build_type: Release
+            cmake_flags: ""
+            env: ""
+          - name: thread-sanitizer
+            build_type: Debug
+            cmake_flags: -DENABLE_THREAD_SANITIZER=ON
+            env: TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: ./scripts/install-linux-deps.sh
+
+      - name: Get ccache dir
+        run: echo "CCACHE_DIR=$(ccache --get-config cache_dir)" >> $GITHUB_ENV
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-packages-${{ matrix.name }}-${{ github.sha }}
+          restore-keys: ccache-packages-${{ matrix.name }}-
+
+      - name: Build
+        run: |
+          # ENABLE_THREAD_SAFE_TILE_REF_COUNT is on by default: package sets need it
+          cmake -B build -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DENABLE_SINGLE_FILES_WERROR=Off \
+            -DENABLE_PYTHON_BINDINGS=Off -DENABLE_NODE_BINDINGS=Off ${{ matrix.cmake_flags }}
+          make -C build -j$(nproc) valhalla_build_tile_refs valhalla_join_packages packageset gurka_packages
+
+      # ThreadSanitizer cannot map its shadow memory with the runners' default ASLR entropy
+      - name: Lower ASLR entropy
+        if: matrix.name == 'thread-sanitizer'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Run package tests
+        working-directory: build
+        run: |
+          env ${{ matrix.env }} ./test/packageset
+          env ${{ matrix.env }} LOCPATH=../locales ./test/gurka/gurka_packages

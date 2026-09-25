@@ -453,7 +453,10 @@ if(ENABLE_DATA_TOOLS)
   if(ENABLE_HTTP AND ENABLE_SERVICES)
     # http_tiles needs the proper .tar file with index.bin; run-scripts is a run-time setup step
     add_dependencies(http_tiles utrecht_tiles)
-    add_dependencies(run-http_tiles run-scripts)
+    # run-scripts only exists when a Python interpreter was found (test/scripts/CMakeLists.txt)
+    if(Python_FOUND)
+      add_dependencies(run-http_tiles run-scripts)
+    endif()
   endif()
 endif()
 

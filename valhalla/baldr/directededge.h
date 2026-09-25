@@ -1204,6 +1204,8 @@ public:
   void json(rapidjson::writer_wrapper_t& writer) const;
 
 protected:
+  friend class PackageSet;
+
   // 1st 8-byte word
   uint64_t endnode_ : 46;      // End node of the directed edge
   uint64_t restrictions_ : 8;  // Restrictions - mask of local edge indexes at the end node

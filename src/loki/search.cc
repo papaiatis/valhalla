@@ -594,8 +594,21 @@ struct bin_handler_t {
   // handle a bin for the range of candidates that share it
   void handle_bin(std::vector<projector_wrapper>::iterator begin,
                   std::vector<projector_wrapper>::iterator end) {
+    // every routing package holding this tile has its own copy of the bin
+    for (const auto& copy : reader.GetTileCopies(begin->cur_tile->id())) {
+      handle_bin_edges(begin, end, copy);
+    }
+
+    // bin is finished, advance the candidates to their respective next bins
+    for (auto p_itr = begin; p_itr != end; ++p_itr) {
+      p_itr->next_bin(reader);
+    }
+  }
+
+  void handle_bin_edges(std::vector<projector_wrapper>::iterator begin,
+                        std::vector<projector_wrapper>::iterator end,
+                        graph_tile_ptr tile) {
     // iterate over the edges in the bin
-    auto tile = begin->cur_tile;
     bool has_bounding_circles = tile->header()->has_bounding_circles();
     auto edges = tile->GetBin(begin->bin_index);
     auto bounding_circles = tile->GetBoundingCircles(begin->bin_index);
@@ -830,11 +843,6 @@ struct bin_handler_t {
         else if (closer_external_reachable)
           p_itr->closest_external_reachable = c_itr->sq_distance;
       }
-    }
-
-    // bin is finished, advance the candidates to their respective next bins
-    for (auto p_itr = begin; p_itr != end; ++p_itr) {
-      p_itr->next_bin(reader);
     }
   }
 

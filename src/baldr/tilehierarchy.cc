@@ -1,5 +1,6 @@
 #include "baldr/tilehierarchy.h"
 #include "baldr/graphtileheader.h"
+#include "baldr/packageset.h"
 #include "midgard/vector2.h"
 
 #include <cassert>
@@ -46,7 +47,7 @@ const TileLevel& TileHierarchy::GetTransitLevel() {
 midgard::AABB2<midgard::PointLL> TileHierarchy::GetGraphIdBoundingBox(const GraphId& id) {
   assert(id.is_valid());
   auto const& tileLevel = levels().at(id.level());
-  return tileLevel.tiles.TileBounds(id.tileid());
+  return tileLevel.tiles.TileBounds(PackageSet::Real(id).tileid());
 }
 
 // Returns the GraphId of the requested tile based on a lat,lng and a level.

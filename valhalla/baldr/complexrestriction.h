@@ -209,6 +209,8 @@ public:
   }
 
 protected:
+  friend class PackageSet;
+
   // From graph Id plus begin date time information (if applicable)
   uint64_t from_graphid_ : 46; // From Graph Id
   uint64_t has_dt_ : 1;        // bit indicating if we have dt time information

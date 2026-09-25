@@ -430,6 +430,8 @@ public:
   static TileCache* createTileCache(const boost::property_tree::ptree& pt);
 };
 
+class PackageSet;
+
 /**
  * Class that manages access to GraphTiles.
  * Uses TileCache to keep a cache of tiles.
@@ -495,6 +497,22 @@ public:
    */
   graph_tile_ptr& GetGraphTile(const GraphId& graphid, graph_tile_ptr& tile) {
     return !tile || tile->id() != graphid.tile_base() ? tile = GetGraphTile(graphid) : tile;
+  }
+
+  /**
+   * Get every copy of a tile. With routing packages configured (mjolnir.packages), each package
+   * holding a geographic tile has its own copy of it; otherwise this is just the tile itself.
+   * @param tile  the tile id, of the tile or of any of its copies
+   * @return the copies that could be loaded
+   */
+  std::vector<graph_tile_ptr> GetTileCopies(const GraphId& tile);
+
+  /**
+   * The routing packages this reader joins (mjolnir.packages), shared by every reader of the same
+   * configuration; null when none are configured.
+   */
+  const std::shared_ptr<const PackageSet>& package_set() const {
+    return packages_;
   }
 
   /**
@@ -1016,6 +1034,9 @@ protected:
   std::unordered_set<GraphId> _404s;
 
   std::unique_ptr<TileCache> cache_;
+
+  // independently built routing packages joined at runtime; null when not configured
+  std::shared_ptr<const PackageSet> packages_;
 
   bool enable_incidents_;
 

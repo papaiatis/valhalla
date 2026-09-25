@@ -1,6 +1,7 @@
 #include "baldr/connectivity_map.h"
 #include "baldr/graphreader.h"
 #include "baldr/json.h"
+#include "baldr/packageset.h"
 #include "baldr/tilehierarchy.h"
 #include "midgard/constants.h"
 #include "midgard/pointll.h"
@@ -129,7 +130,8 @@ connectivity_map_t::connectivity_map_t(const boost::property_tree::ptree& pt,
   for (const auto& t : tiles) {
     auto& level_colors =
         colors.insert({t.level(), std::unordered_map<uint32_t, size_t>{}}).first->second;
-    level_colors.insert({t.tileid(), 0});
+    // package copies of a tile lie above the tile grid; color the geographic tile
+    level_colors.insert({PackageSet::Real(t).tileid(), 0});
   }
 
   // All tiles have color 0 (not connected), go through and connect

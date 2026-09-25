@@ -1,18 +1,24 @@
 #include "baldr/graphreader.h"
 #include "baldr/curl_tilegetter.h"
+#include "baldr/packageset.h"
 #include "incident_singleton.h"
 #include "midgard/encoded.h"
 #include "midgard/logging.h"
 #include "midgard/util.h"
 #include "shortcut_recovery.h"
 
+#include <boost/property_tree/json_parser.hpp>
 #include <sys/stat.h>
 
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
+#include <mutex>
 #include <span>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 using namespace valhalla::midgard;
@@ -442,10 +448,13 @@ TileCache* TileCacheFactory::createTileCache(const boost::property_tree::ptree& 
                              ? TileCacheLRU::MemoryLimitControl::HARD
                              : TileCacheLRU::MemoryLimitControl::SOFT;
 
-  bool use_simple_cache = pt.get<bool>("use_simple_mem_cache", false);
+  // package copy tile ids lie above the tile grid, which the flat cache indexes by
+  const bool has_packages = static_cast<bool>(pt.get_child_optional("packages"));
+  bool use_simple_cache = pt.get<bool>("use_simple_mem_cache", false) || has_packages;
 
-  // wrap tile cache with thread-safe version
-  if (pt.get<bool>("global_synchronized_cache", false)) {
+  // wrap tile cache with thread-safe version; package sets share their tiles themselves, and the
+  // same copy id names another package's tile in another package set
+  if (pt.get<bool>("global_synchronized_cache", false) && !has_packages) {
     // Handle synchronization of cache
     static std::mutex globalCacheMutex_;
     static std::shared_ptr<TileCache> globalTileCache_;
@@ -477,6 +486,38 @@ TileCache* TileCacheFactory::createTileCache(const boost::property_tree::ptree& 
   return new FlatTileCache(max_cache_size);
 }
 
+namespace {
+
+// Joined packages cost memory and time per instance (rewritten tiles, node grids, ownership caches),
+// and mobile wrappers build a new GraphReader for every request, so every reader of the same
+// package configuration shares one PackageSet. It is released with its last reader.
+std::shared_ptr<const PackageSet> SharedPackageSet(const boost::property_tree::ptree& pt) {
+  const auto packages = pt.get_child_optional("packages");
+  if (!packages) {
+    return nullptr;
+  }
+  // every setting PackageSet::FromConfig reads
+  std::ostringstream key;
+  boost::property_tree::write_json(key, *packages, false);
+  key << pt.get<std::string>("package_join_tolerance", "") << '\n'
+      << pt.get<std::string>("package_joined", "");
+  static std::mutex mutex;
+  static std::unordered_map<std::string, std::weak_ptr<const PackageSet>> shared;
+  std::lock_guard<std::mutex> lock(mutex);
+  for (auto it = shared.begin(); it != shared.end();) {
+    it = it->second.expired() ? shared.erase(it) : std::next(it);
+  }
+  auto& weak = shared[key.str()];
+  auto set = weak.lock();
+  if (!set) {
+    set = PackageSet::FromConfig(pt);
+    weak = set;
+  }
+  return set;
+}
+
+} // namespace
+
 // Constructor using separate tile files
 GraphReader::GraphReader(const boost::property_tree::ptree& pt,
                          std::unique_ptr<tile_getter_t>&& tile_getter,
@@ -490,7 +531,7 @@ GraphReader::GraphReader(const boost::property_tree::ptree& pt,
       is_tar_url_(!tile_url_.empty() &&
                   tile_url_.find(GraphTile::kTilePathPattern) == std::string::npos),
       url_id_txt_checksum_(load_id_txt_checksum(url_id_txt_path_, tile_url_)),
-      cache_(TileCacheFactory::createTileCache(pt)) {
+      cache_(TileCacheFactory::createTileCache(pt)), packages_(SharedPackageSet(pt)) {
 
   if (!tile_url_.empty()) {
     // Make a tile fetcher if we havent passed one in from somewhere else
@@ -546,6 +587,9 @@ bool GraphReader::DoesTileExist(const GraphId& graphid) const {
   if (!graphid.is_valid() || graphid.level() > TileHierarchy::get_max_level()) {
     return false;
   }
+  if (packages_) {
+    return packages_->Exists(graphid.tile_base());
+  }
   // if you are using an extract only check that
   if (!tile_extract_->tiles.empty()) {
     return tile_extract_->tiles.find(graphid) != tile_extract_->tiles.cend();
@@ -589,6 +633,15 @@ graph_tile_ptr GraphReader::GetGraphTile(const GraphId& graphid) {
   if (const auto& cached = cache_->Get(base)) {
     // LOG_DEBUG("Memory cache hit " + GraphTile::FileSuffix(base));
     return cached;
+  }
+
+  if (packages_) {
+    auto tile = packages_->LoadTile(base);
+    if (!tile) {
+      return nullptr;
+    }
+    const size_t size = tile->header()->end_offset();
+    return cache_->Put(base, std::move(tile), size);
   }
 
   // Try getting it from the memmapped tar extract
@@ -669,6 +722,22 @@ graph_tile_ptr GraphReader::GetGraphTile(const GraphId& graphid) {
   return cache_->Put(base, std::move(tile), size);
 }
 
+std::vector<graph_tile_ptr> GraphReader::GetTileCopies(const GraphId& tile) {
+  std::vector<graph_tile_ptr> tiles;
+  if (!packages_) {
+    if (auto t = GetGraphTile(tile)) {
+      tiles.push_back(std::move(t));
+    }
+    return tiles;
+  }
+  for (const auto& id : packages_->Copies(tile)) {
+    if (auto t = GetGraphTile(id)) {
+      tiles.push_back(std::move(t));
+    }
+  }
+  return tiles;
+}
+
 std::optional<GraphTileHeader> GraphReader::GetGraphTileHeader(const GraphId& graphid) {
   if (!graphid.is_valid()) {
     return std::nullopt;
@@ -677,6 +746,13 @@ std::optional<GraphTileHeader> GraphReader::GetGraphTileHeader(const GraphId& gr
   auto base = graphid.tile_base();
   if (const auto& cached = cache_->Get(base)) {
     return *cached->header();
+  }
+
+  if (packages_) {
+    if (const auto tile = GetGraphTile(base)) {
+      return *tile->header();
+    }
+    return std::nullopt;
   }
 
   // straight out of the mmapped extract, without constructing or caching the tile
@@ -962,6 +1038,12 @@ std::string GraphReader::encoded_edge_shape(const valhalla::baldr::GraphId& edge
 std::unordered_set<GraphId> GraphReader::GetTileSet() const {
   // either mmap'd tiles
   std::unordered_set<GraphId> tiles;
+  if (packages_) {
+    for (const auto& t : packages_->AllTiles()) {
+      tiles.emplace(t);
+    }
+    return tiles;
+  }
   if (tile_extract_->tiles.size()) {
     for (const auto& t : tile_extract_->tiles) {
       tiles.emplace(t.first);
@@ -995,6 +1077,14 @@ std::unordered_set<GraphId> GraphReader::GetTileSet() const {
 std::unordered_set<GraphId> GraphReader::GetTileSet(const uint8_t level) const {
   // either mmap'd tiles
   std::unordered_set<GraphId> tiles;
+  if (packages_) {
+    for (const auto& t : packages_->AllTiles()) {
+      if (t.level() == level) {
+        tiles.emplace(t);
+      }
+    }
+    return tiles;
+  }
   if (tile_extract_->tiles.size()) {
     for (const auto& t : tile_extract_->tiles) {
       if (static_cast<GraphId>(t.first).level() == level) {

@@ -1,6 +1,7 @@
 #include "baldr/graphtile.h"
 #include "baldr/compression_utils.h"
 #include "baldr/curl_tilegetter.h"
+#include "baldr/packageset.h"
 #include "baldr/sign.h"
 #include "baldr/tilehierarchy.h"
 #include "exceptions.h"
@@ -551,7 +552,7 @@ AABB2<PointLL> GraphTile::BoundingBox() const {
   const auto& tiles = header_->graphid().level() == TileHierarchy::GetTransitLevel().level
                           ? TileHierarchy::GetTransitLevel().tiles
                           : TileHierarchy::levels()[header_->graphid().level()].tiles;
-  return tiles.TileBounds(header_->graphid().tileid());
+  return tiles.TileBounds(PackageSet::Real(header_->graphid()).tileid());
 }
 
 std::span<const DirectedEdge> GraphTile::GetDirectedEdges(const NodeInfo* node) const {

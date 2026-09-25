@@ -222,7 +222,10 @@ CandidateGridQuery::GetGrid(const int32_t bin_id,
   // Insert the bin into the cache and index the bin
   const auto inserted =
       grid_cache_.emplace(bin_id, grid_t(tile->BoundingBox(), cell_width_, cell_height_));
-  IndexBin(tile, bin_index, reader_, inserted.first->second);
+  // every routing package holding this tile has its own copy of the bin
+  for (const auto& copy : reader_.GetTileCopies(tileid)) {
+    IndexBin(copy, bin_index, reader_, inserted.first->second);
+  }
   return &(inserted.first->second);
 }
 

@@ -47,9 +47,10 @@ option(ENABLE_COMPILER_WARNINGS "Build with compiler warnings" OFF)
 option(ENABLE_SANITIZERS "Use all the integrated sanitizers for Debug build" OFF)
 option(ENABLE_ADDRESS_SANITIZER "Use memory sanitizer for Debug build" OFF)
 option(ENABLE_UNDEFINED_SANITIZER "Use UB sanitizer for Debug build" OFF)
+option(ENABLE_THREAD_SANITIZER "Use thread sanitizer for Debug build" OFF)
 option(ENABLE_TESTS "Enable Valhalla tests" ON)
 option(ENABLE_WERROR "Convert compiler warnings to errors. Requires ENABLE_COMPILER_WARNINGS=ON to take effect" OFF)
-option(ENABLE_THREAD_SAFE_TILE_REF_COUNT "If ON uses shared_ptr as tile reference(i.e. it is thread safe)" OFF)
+option(ENABLE_THREAD_SAFE_TILE_REF_COUNT "If ON uses shared_ptr as tile reference(i.e. it is thread safe); routing packages (mjolnir.packages) need it" ON)
 option(ENABLE_SINGLE_FILES_WERROR "Convert compiler warnings to errors for single files" ON)
 option(PREFER_EXTERNAL_DEPS "Whether to use internally vendored headers or find the equivalent external package" OFF)
 # useful to workaround issues likes this https://stackoverflow.com/questions/24078873/cmake-generated-xcode-project-wont-compile
@@ -343,7 +344,8 @@ endif()
 
 ## Valhalla programs
 set(valhalla_programs
-    valhalla_export_edges valhalla_expand_bounding_box valhalla_service)
+    valhalla_export_edges valhalla_expand_bounding_box valhalla_service valhalla_build_tile_refs
+    valhalla_join_packages)
 
 ## Valhalla data tools
 set(valhalla_data_tools valhalla_build_statistics valhalla_ways_to_edges valhalla_validate_transit
@@ -364,6 +366,14 @@ if(ENABLE_TOOLS)
     target_include_directories(${program} PRIVATE ${cxxopts_include_dir})
     install(TARGETS ${program} DESTINATION "${CMAKE_INSTALL_BINDIR}" COMPONENT runtime)
   endforeach()
+endif()
+
+if(ENABLE_TOOLS)
+  # diagnostics for routing packages, built on request only and not installed
+  add_executable(valhalla_package_stats EXCLUDE_FROM_ALL src/valhalla_package_stats.cc)
+  set_target_properties(valhalla_package_stats PROPERTIES FOLDER "Tools")
+  target_link_libraries(valhalla_package_stats valhalla)
+  target_include_directories(valhalla_package_stats PRIVATE ${cxxopts_include_dir})
 endif()
 
 if(ENABLE_DATA_TOOLS)

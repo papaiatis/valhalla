@@ -3,7 +3,7 @@ LABEL org.opencontainers.image.authors="Kevin Kreiser <kevinkreiser@gmail.com>"
 
 # set paths
 ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
-ENV LD_LIBRARY_PATH=/usr/local/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib32:/usr/lib32
+ENV LD_LIBRARY_PATH=/usr/local/lib
 RUN export DEBIAN_FRONTEND=noninteractive && apt update && apt install -y sudo
 
 # install deps
@@ -65,11 +65,11 @@ LABEL org.opencontainers.image.authors="Kevin Kreiser <kevinkreiser@gmail.com>"
 
 # basic paths
 ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH
-ENV LD_LIBRARY_PATH=/usr/local/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:/lib32:/usr/lib32
+ENV LD_LIBRARY_PATH=/usr/local/lib
 
 # github packaging niceties
 LABEL org.opencontainers.image.description="Open Source Routing Engine for OpenStreetMap and Other Datasources"
-LABEL org.opencontainers.image.source="https://github.com/valhalla/valhalla"
+LABEL org.opencontainers.image.source="https://github.com/papaiatis/valhalla"
 
 # we need to add back some runtime dependencies for binaries and scripts
 # install all the posix locales that we support

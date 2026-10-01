@@ -772,21 +772,10 @@ TEST_F(SplitJoin, ConsistentGraph) {
 }
 
 // Loading every tile from many threads at once gives the same tiles as loading them one by one.
-TEST_F(SplitJoin, ParallelLoadsEqualSerialLoads) {
-  const auto config = maps_.joined.config.get_child("mjolnir");
-  // a package set of its own, not shared with the readers below
-  std::map<GraphId, std::string> expected;
-  {
-    const auto serial = PackageSet::FromConfig(config);
-    for (const auto& id : serial->AllTiles()) {
-      const auto tile = serial->LoadTile(id);
-      ASSERT_TRUE(tile);
-      expected[id] =
-          std::string(reinterpret_cast<const char*>(tile->header()), tile->header()->end_offset());
-    }
-  }
-  ASSERT_FALSE(expected.empty());
-
+// Readers on 8 threads, each loading every tile in its own order from one shared package set, get
+// the tiles of a serial load.
+void ExpectParallelLoadsEqual(const boost::property_tree::ptree& config,
+                              const std::map<GraphId, std::string>& expected) {
   // every round's readers share one package set, released with them
   for (int round = 0; round < 3; ++round) {
     std::vector<std::map<GraphId, std::string>> loaded(8);
@@ -815,6 +804,27 @@ TEST_F(SplitJoin, ParallelLoadsEqualSerialLoads) {
   }
 }
 
+TEST_F(SplitJoin, ParallelLoadsEqualSerialLoads) {
+  const auto config = maps_.joined.config.get_child("mjolnir");
+  // a package set of its own, not shared with the readers below
+  const auto expected = LoadAll(*PackageSet::FromConfig(config));
+  ASSERT_FALSE(expected.empty());
+  ExpectParallelLoadsEqual(config, expected);
+}
+
+// The tiles of the overlays are patched in the packages' private mappings by whichever thread asks
+// first: threads that share a page of a mapping must not disturb each other.
+TEST_F(SplitJoin, ParallelLoadsFromOverlaysEqualSerialLoads) {
+  const auto config = maps_.joined.config.get_child("mjolnir");
+  const auto expected = LoadAll(*PackageSet::FromConfig(config));
+  const std::string dir = VALHALLA_BUILD_DIR "test/data/gurka_packages/split/parallel_overlays";
+  fs::remove_all(dir);
+  PackageSet::WriteOverlays(config, dir);
+  const auto with_overlays = WithOverlays(maps_.joined, dir).config.get_child("mjolnir");
+  ASSERT_TRUE(PackageSet::FromConfig(with_overlays)->uses_overlays());
+  ExpectParallelLoadsEqual(with_overlays, expected);
+}
+
 // The routes of RoutesEqualTheSingleGraph through a few of the pairs, for maps that must route
 // like the single graph.
 void ExpectSingleGraphRoutes(const gurka::map& map, const gurka::map& single) {
@@ -827,7 +837,7 @@ void ExpectSingleGraphRoutes(const gurka::map& map, const gurka::map& single) {
   }
 }
 
-TEST_F(SplitJoin, OverlaysHoldTheChangedTilesOnly) {
+TEST_F(SplitJoin, OverlaysPatchTheChangedTilesOnly) {
   const auto config = maps_.joined.config.get_child("mjolnir");
   const std::string dir = VALHALLA_BUILD_DIR "test/data/gurka_packages/split/overlays";
   fs::remove_all(dir);
@@ -842,29 +852,21 @@ TEST_F(SplitJoin, OverlaysHoldTheChangedTilesOnly) {
 
   size_t overlay_tiles = 0;
   for (const auto& package : maps_.packages) {
-    const auto original = TarTileBytes(package.tar);
-    const auto overlay = TarTileBytes(OverlayFile(dir, package.name));
+    // the tiles the join changed, compared with the package's own
     size_t changed = 0;
-    for (const auto& [real, bytes] : original) {
+    for (const auto& [real, bytes] : TarTileBytes(package.tar)) {
       const auto copy = CopyOf(*runtime, package.name, real);
       ASSERT_TRUE(copy.is_valid()) << package.name << " " << real;
-      const auto& rewritten = joined.at(copy);
-      const auto in_overlay = overlay.find(real);
-      if (rewritten == bytes) {
-        EXPECT_EQ(in_overlay, overlay.end()) << package.name << " " << real << " did not change";
-      } else {
-        ++changed;
-        ASSERT_NE(in_overlay, overlay.end()) << package.name << " " << real << " changed";
-        EXPECT_TRUE(in_overlay->second == rewritten) << package.name << " " << real;
-      }
+      changed += joined.at(copy) != bytes;
     }
     EXPECT_GT(changed, 0u) << package.name;
-    EXPECT_EQ(overlay.size(), changed) << package.name;
-    overlay_tiles += overlay.size();
+    overlay_tiles += changed;
     const auto written = std::find_if(report.overlays.begin(), report.overlays.end(),
                                       [&](const auto& o) { return o.name == package.name; });
     ASSERT_NE(written, report.overlays.end());
-    EXPECT_EQ(written->tiles, overlay.size());
+    EXPECT_EQ(written->tiles, changed) << package.name;
+    EXPECT_EQ(written->bytes, fs::file_size(OverlayFile(dir, package.name))) << package.name;
+    EXPECT_LT(written->bytes, fs::file_size(package.tar)) << package.name;
   }
 
   // with the overlays, loading a tile rewrites nothing and gives the same tiles
@@ -884,7 +886,8 @@ TEST_F(SplitJoin, OverlaysHoldTheChangedTilesOnly) {
 
 // Joined tiles are byte-identical on every platform. The grid of SplitJoin, shrunk into one
 // level-2 tile: tile builds number the nodes of levels 0 and 1 in the order they visit the level-2
-// tiles, which varies from build to build when there are several.
+// tiles, which varies from build to build when there are several. The overlay files themselves
+// aren't hashed: their patches are deflated, and zlib builds differ in what they write.
 TEST(GoldenJoin, OverlayHashes) {
   const auto layout = gurka::detail::map_to_coordinates(SplitAscii(), 50, {5.2, 52.1});
   const double line = (layout.at("D").lng() + layout.at("E").lng()) / 2;
@@ -896,8 +899,27 @@ TEST(GoldenJoin, OverlayHashes) {
   // When the join or the tile format changes on purpose, update the hashes from this output.
   EXPECT_EQ(Fnv1a(ReadFile(maps.packages[0].tar)), 535886572131682744ull) << "west tiles";
   EXPECT_EQ(Fnv1a(ReadFile(maps.packages[1].tar)), 9302745409726607298ull) << "east tiles";
-  EXPECT_EQ(Fnv1a(ReadFile(OverlayFile(dir, "west"))), 16156776531689387855ull) << "west overlay";
-  EXPECT_EQ(Fnv1a(ReadFile(OverlayFile(dir, "east"))), 15970251218106846668ull) << "east overlay";
+  // the tiles each package serves from its overlay, in tile order
+  const auto served =
+      PackageSet::FromConfig(WithOverlays(maps.joined, dir).config.get_child("mjolnir"));
+  ASSERT_TRUE(served->uses_overlays());
+  const auto tiles = LoadAll(*served);
+  const auto joined_hash = [&](const Package& package) {
+    std::string bytes;
+    for (const auto& [real, original] : TarTileBytes(package.tar)) {
+      bytes += tiles.at(CopyOf(*served, package.name, real));
+    }
+    return Fnv1a(bytes);
+  };
+  const auto patches_hash = [&](const std::string& name) {
+    const auto overlay = std::find_if(report.overlays.begin(), report.overlays.end(),
+                                      [&](const auto& o) { return o.name == name; });
+    return overlay == report.overlays.end() ? 0 : overlay->content_hash;
+  };
+  EXPECT_EQ(patches_hash("west"), 10945871183313045016ull) << "west patches";
+  EXPECT_EQ(patches_hash("east"), 3877405390329665803ull) << "east patches";
+  EXPECT_EQ(joined_hash(maps.packages[0]), 3014461116394766175ull) << "west joined tiles";
+  EXPECT_EQ(joined_hash(maps.packages[1]), 18440462409556805356ull) << "east joined tiles";
 }
 
 TEST_F(SplitJoin, MissingOrStaleOverlaysFallBackToTheRuntimeJoin) {
@@ -950,9 +972,15 @@ TEST_F(SplitJoin, MissingOrStaleOverlaysFallBackToTheRuntimeJoin) {
   expect_fallback(WithOverlays(maps_.joined, dir), "truncated overlay");
   WriteFile(OverlayFile(dir, "east"), std::string(east.size(), 'x'));
   expect_fallback(WithOverlays(maps_.joined, dir), "garbage overlay");
-  // cut inside the last tile's data, at a tar block boundary
-  WriteFile(OverlayFile(dir, "east"), east.substr(0, east.size() - 3 * 512));
-  expect_fallback(WithOverlays(maps_.joined, dir), "overlay truncated at a block boundary");
+  WriteFile(OverlayFile(dir, "east"), east.substr(0, east.size() - 1));
+  expect_fallback(WithOverlays(maps_.joined, dir), "overlay without its last byte");
+  // one flipped bit in the middle of the patches
+  auto flipped = east;
+  flipped[flipped.size() * 3 / 4] ^= 1;
+  WriteFile(OverlayFile(dir, "east"), flipped);
+  expect_fallback(WithOverlays(maps_.joined, dir), "overlay with a flipped bit");
+  WriteFile(OverlayFile(dir, "east"), east + std::string(1, '\0'));
+  expect_fallback(WithOverlays(maps_.joined, dir), "overlay with a trailing byte");
 }
 
 TEST_F(SplitJoin, OverlaysDependOnlyOnThePackageSet) {
@@ -1020,8 +1048,8 @@ TEST_F(SplitJoin, OverlaysDoNotDependOnTheThreadCount) {
     }
   }
   // the golden overlays are the ones a multi-threaded join writes too
-  const auto served = PackageSet::FromConfig(
-      WithOverlays(maps_.joined, base + "/7").config.get_child("mjolnir"));
+  const auto served =
+      PackageSet::FromConfig(WithOverlays(maps_.joined, base + "/7").config.get_child("mjolnir"));
   EXPECT_TRUE(served->uses_overlays());
 }
 
@@ -1262,7 +1290,9 @@ protected:
     all_ = PackageMap({west, middle, east}, dir + "/all", layout_);
   }
 
-  static double Lng(size_t i) { return layout_.at(std::string(1, kNodes[i])).lng(); }
+  static double Lng(size_t i) {
+    return layout_.at(std::string(1, kNodes[i])).lng();
+  }
 
   static const std::string kNodes;
   static gurka::nodelayout layout_;
@@ -1322,9 +1352,9 @@ TEST(NestedPackages, DeletingTheInnerGivesTheAreaBack) {
   const double spacing = layout.at("B").lng() - layout.at("A").lng();
   const double min = layout.at("C").lng() - spacing / 2, max = layout.at("E").lng() + spacing / 2;
   const auto outer = BuildPackage(dir, "outer", layout, ways, {}, {4.0, 51.0, 6.0, 53.0}, 1);
-  const auto inner = BuildPackage(dir, "inner", layout,
-                                  WaysWithin(ways, layout, min - spacing, max + spacing), {},
-                                  {min, 51.0, max, 53.0}, 2);
+  const auto inner =
+      BuildPackage(dir, "inner", layout, WaysWithin(ways, layout, min - spacing, max + spacing), {},
+                   {min, 51.0, max, 53.0}, 2);
 
   const auto both = PackageMap({outer, inner}, dir + "/both", layout);
   const auto set = PackageSet::FromConfig(both.config.get_child("mjolnir"));

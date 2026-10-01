@@ -2,6 +2,7 @@
 
 #include <valhalla/baldr/graphid.h>
 #include <valhalla/baldr/graphtileptr.h>
+#include <valhalla/baldr/tilepatch.h>
 #include <valhalla/midgard/aabb2.h>
 #include <valhalla/midgard/pointll.h>
 
@@ -85,9 +86,11 @@ private:
  *
  * The join happens when a tile is first loaded (the runtime join, rewriting the tile in a private
  * copy-on-write mapping of its package), or once ahead of time: WriteOverlays writes, per package,
- * the tiles the join changed into an overlay, and a set configured with those overlays serves
- * every tile as stored. Overlays that do not match the configured packages are ignored with a
- * warning, and the set falls back to the runtime join.
+ * an overlay with a patch (tilepatch.h) for every tile the join changed, and a set configured with
+ * those overlays applies a tile's patch, in the same private mapping, when the tile is first
+ * loaded. A joined tile has a few percent of its bytes changed, so an overlay is a few hundred
+ * kilobytes for packages of gigabytes. Overlays that do not match the configured packages are
+ * ignored with a warning, and the set falls back to the runtime join.
  *
  * Configuration, in the mjolnir section:
  *   packages                list of {name, tile_extract, polygon, build_time, tile_refs}:
@@ -124,7 +127,10 @@ public:
   struct Overlay {
     std::string name;   // package name
     uint64_t tiles = 0; // tiles the join changed
-    uint64_t bytes = 0; // their size
+    uint64_t bytes = 0; // size of the overlay file
+    // hash of what the patches change, the same on every platform (the file is deflated, and
+    // zlib builds differ in what they write)
+    uint64_t content_hash = 0;
   };
   struct JoinReport {
     uint64_t key = 0; // join key of the package set
@@ -134,10 +140,10 @@ public:
 
   /**
    * Joins every tile of the configured packages, one tile at a time, and writes each package's
-   * overlay to dir/<name>.joined: a tar whose first entry holds the join key and the copy ids the
-   * join used, followed by every tile the join changed. The overlays are written under temporary
-   * names and renamed when all are complete. They depend only on the package set, not on the
-   * order of the configuration or on other package sets in the process. Throws
+   * overlay to dir/<name>.joined: a file with the join key, the copy ids the join used, and a patch
+   * for every tile the join changed (the tiles themselves are not stored). The overlays are
+   * written under temporary names and renamed when all are complete. They depend only on the package
+   * set, not on the order of the configuration or on other package sets in the process. Throws
    * std::runtime_error on failure, leaving the previous overlays in place.
    */
   static JoinReport WriteOverlays(const boost::property_tree::ptree& pt, const std::string& dir);
@@ -240,6 +246,9 @@ private:
   //  kIdsOnly   as kLinksOnly, and a tile on the same level is in a slot > 0: remap end nodes too
   //  kFull      anything else, or no index shipped
   enum class Work { kNone, kLinksOnly, kIdsOnly, kFull };
+
+  // Where the parts a join changes lie in a tile, for the tile patches of the overlays.
+  static TileWords Layout(const GraphTile& tile);
 
   // Id in the package's copy of `real` (a GraphId from package `pkg`'s own tiles); an id in no
   // tile if the package does not ship the tile.

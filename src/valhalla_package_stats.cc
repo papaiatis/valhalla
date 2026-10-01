@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <map>
 #include <memory>
@@ -25,7 +26,7 @@ using namespace valhalla;
 int main(int argc, char** argv) {
   const auto program = std::filesystem::path(__FILE__).stem().string();
   boost::property_tree::ptree config;
-  bool list_restrictions = false;
+  bool list_restrictions = false, digest = false;
   try {
     cxxopts::Options options(program, program + " " + VALHALLA_PRINT_VERSION +
                                           "\n\nReports how independently built packages join.\n");
@@ -35,10 +36,12 @@ int main(int argc, char** argv) {
       ("v,version", "Print the version of this software.")
       ("c,config", "Path to the json configuration file.", cxxopts::value<std::string>())
       ("i,inline-config", "Inline JSON config", cxxopts::value<std::string>())
-      ("r,restrictions", "List complex restrictions whose edges lie in more than one package.");
+      ("r,restrictions", "List complex restrictions whose edges lie in more than one package.")
+      ("d,digest", "Hash every loaded tile's bytes, to compare how two configurations serve the tiles.");
     // clang-format on
     auto result = options.parse(argc, argv);
     list_restrictions = result.count("restrictions") > 0;
+    digest = result.count("digest") > 0;
     if (!parse_common_args(program, options, result, &config, "mjolnir.logging")) {
       return EXIT_SUCCESS;
     }
@@ -62,11 +65,18 @@ int main(int argc, char** argv) {
   const auto opened = std::chrono::steady_clock::now();
 
   size_t tiles = 0, bytes = 0, mutable_bytes = 0;
+  uint64_t tiles_digest = 14695981039346656037ull; // FNV-1a over every tile's bytes, in id order
   for (const auto& id : packages->AllTiles()) {
     if (auto tile = packages->LoadTile(id)) {
       ++tiles;
       const auto* header = tile->header();
       bytes += header->end_offset();
+      if (digest) {
+        const auto* data = reinterpret_cast<const unsigned char*>(header);
+        for (size_t i = 0; i < header->end_offset(); ++i) {
+          tiles_digest = (tiles_digest ^ data[i]) * 1099511628211ull;
+        }
+      }
       // the parts the rewrite changes: header, directed edges, transitions, bins, restrictions
       mutable_bytes += sizeof(baldr::GraphTileHeader) +
                        header->directededgecount() * sizeof(baldr::DirectedEdge) +
@@ -161,6 +171,21 @@ int main(int argc, char** argv) {
     return EXIT_SUCCESS;
   }
 
+  // memory of this process, from the kernel (Linux only)
+  std::string memory;
+  {
+    std::ifstream rollup("/proc/self/smaps_rollup");
+    std::string line;
+    while (std::getline(rollup, line)) {
+      for (const char* field : {"Rss", "Pss", "Pss_Anon", "Pss_File", "Private_Dirty", "Anonymous"}) {
+        if (line.rfind(std::string(field) + ":", 0) == 0) {
+          memory += ", \"" + std::string(field) + "_kb\": " +
+                    line.substr(line.find(':') + 1, line.find(" kB") - line.find(':') - 1);
+        }
+      }
+    }
+  }
+
   const auto stats = packages->stats();
   const auto secs = [](auto a, auto b) { return std::chrono::duration<double>(b - a).count(); };
   std::cout << "{\"tiles\": " << tiles << ", \"tile_bytes\": " << bytes
@@ -172,6 +197,8 @@ int main(int argc, char** argv) {
             << ", \"overlay_tiles\": " << stats.overlay_tiles
             << ", \"uses_overlays\": " << (packages->uses_overlays() ? "true" : "false")
             << ", \"open_seconds\": " << secs(start, opened)
-            << ", \"load_rewrite_seconds\": " << secs(opened, loaded) << "}" << std::endl;
+            << ", \"load_rewrite_seconds\": " << secs(opened, loaded)
+            << (digest ? ", \"tiles_digest\": \"" + std::to_string(tiles_digest) + "\"" : "")
+            << memory << "}" << std::endl;
   return EXIT_SUCCESS;
 }

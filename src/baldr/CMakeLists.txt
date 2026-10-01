@@ -65,6 +65,7 @@ set(sources
     graphreader.cc
     graphtile.cc
     packageset.cc
+    tilepatch.cc
     graphtileheader.cc
     incident_singleton.h
     edgetracker.cc

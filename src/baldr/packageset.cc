@@ -2,6 +2,7 @@
 #include "baldr/complexrestriction.h"
 #include "baldr/graphtile.h"
 #include "baldr/tilehierarchy.h"
+#include "baldr/tilepatch.h"
 #include "config.h"
 #include "midgard/constants.h"
 #include "midgard/logging.h"
@@ -55,18 +56,23 @@ constexpr float kReachPadDeg = 1e-5f;
 // Tile reference index: "VTRF", then its format version.
 constexpr uint32_t kTileRefsMagic = 0x46525456;
 constexpr uint32_t kTileRefsVersion = 2;
-// First entry of an overlay: "VPKJ", its format version, the join key, the number and bytes of
-// the tiles that follow, and the copy ids the join used.
-constexpr char kJoinEntry[] = "package_join";
+// An overlay is one file per package: "VPKJ", its format version, the join key, the number of
+// patched tiles, the number of copy ids, a hash of everything after this 32-byte header, then the
+// copy ids the join used, a directory (tile id, offset, size) of the patches in tile id order, and
+// the patches themselves (see MakeTilePatch).
 constexpr uint32_t kOverlayMagic = 0x4a4b5056;
-constexpr uint32_t kOverlayVersion = 1;
-constexpr size_t kJoinEntryCountOffset = 16;
-constexpr size_t kJoinEntryBytesOffset = 24;
-constexpr size_t kJoinEntryIdsOffset = 32;
+constexpr uint32_t kOverlayVersion = 2;
+constexpr size_t kOverlayTileCountOffset = 16;
+constexpr size_t kOverlayIdCountOffset = 20;
+constexpr size_t kOverlayHashOffset = 24;
+constexpr size_t kOverlayHeaderSize = 32;
+constexpr size_t kOverlayIdSize = 16;
+constexpr size_t kOverlayDirectorySize = 12;
+// zlib level of the patches; higher levels save few bytes
+constexpr int kPatchLevel = 9;
 // Version of the join itself: a change that changes joined tiles must bump it, so overlays
 // written before are stale.
 constexpr uint64_t kJoinVersion = 1;
-constexpr size_t kTarBlock = 512;
 // Bytes of package tiles an ahead-of-time join rewrites between drops of the mapped pages.
 constexpr size_t kReleaseBytes = size_t(64) << 20;
 
@@ -781,73 +787,34 @@ template <typename T> void Store(T& target, const T& value) {
   }
 }
 
-// Writes a tar of regular files: fixed metadata, so equal contents give equal bytes.
-class TarWriter {
+// Writes a file, durably once Sync is called.
+class DurableFile {
 public:
-  explicit TarWriter(const std::string& file) : file_(file), out_(std::fopen(file.c_str(), "wb")) {
+  explicit DurableFile(const std::string& file) : file_(file), out_(std::fopen(file.c_str(), "wb")) {
     if (!out_) {
       throw std::runtime_error("Cannot write " + file + ": " + strerror(errno));
     }
   }
-  ~TarWriter() {
+  ~DurableFile() {
     if (out_) {
       std::fclose(out_);
     }
   }
-  TarWriter(const TarWriter&) = delete;
-  TarWriter& operator=(const TarWriter&) = delete;
+  DurableFile(const DurableFile&) = delete;
+  DurableFile& operator=(const DurableFile&) = delete;
 
-  void Add(const std::string& name, const char* data, size_t size) {
-    if (name.size() >= sizeof(midgard::tar::header_t::name)) {
-      throw std::runtime_error("Tar entry name too long: " + name);
-    }
-    midgard::tar::header_t header{};
-    std::memcpy(header.name, name.data(), name.size());
-    std::snprintf(header.mode, sizeof(header.mode), "%07o", 0644);
-    std::snprintf(header.uid, sizeof(header.uid), "%07o", 0);
-    std::snprintf(header.gid, sizeof(header.gid), "%07o", 0);
-    std::snprintf(header.size, sizeof(header.size), "%011llo", static_cast<unsigned long long>(size));
-    std::snprintf(header.mtime, sizeof(header.mtime), "%011o", 0);
-    header.typeflag = '0';
-    std::memcpy(header.magic, "ustar", 6);
-    std::memcpy(header.version, "00", 2);
-    std::memset(header.chksum, ' ', sizeof(header.chksum));
-    unsigned sum = 0;
-    for (size_t i = 0; i < sizeof(header); ++i) {
-      sum += reinterpret_cast<const unsigned char*>(&header)[i];
-    }
-    std::snprintf(header.chksum, sizeof(header.chksum), "%06o", sum);
-    header.chksum[7] = ' ';
-    Write(&header, sizeof(header));
-    Write(data, size);
-    Pad(size);
-  }
-
-  // Overwrites bytes of the first entry's data.
-  void Patch(size_t offset, const std::string& bytes) {
-    if (std::fseek(out_, static_cast<long>(kTarBlock + offset), SEEK_SET) != 0) {
-      throw std::runtime_error("Cannot write " + file_ + ": " + strerror(errno));
-    }
-    Write(bytes.data(), bytes.size());
-    if (std::fseek(out_, 0, SEEK_END) != 0) {
-      throw std::runtime_error("Cannot write " + file_ + ": " + strerror(errno));
-    }
-  }
-
-  // Ends the archive; Sync makes it durable.
-  void End() {
-    const std::vector<char> end(2 * kTarBlock, 0);
-    Write(end.data(), end.size());
-    if (std::fflush(out_) != 0) {
+  void Write(const std::string& bytes) {
+    if (!bytes.empty() && std::fwrite(bytes.data(), 1, bytes.size(), out_) != bytes.size()) {
       throw std::runtime_error("Cannot write " + file_ + ": " + strerror(errno));
     }
   }
 
   void Sync() {
+    bool ok = std::fflush(out_) == 0;
 #ifdef _WIN32
-    bool ok = _commit(_fileno(out_)) == 0;
+    ok = ok && _commit(_fileno(out_)) == 0;
 #else
-    bool ok = fsync(fileno(out_)) == 0;
+    ok = ok && fsync(fileno(out_)) == 0;
 #endif
     ok = std::fclose(out_) == 0 && ok;
     out_ = nullptr;
@@ -857,16 +824,6 @@ public:
   }
 
 private:
-  void Write(const void* data, size_t size) {
-    if (size > 0 && std::fwrite(data, 1, size, out_) != size) {
-      throw std::runtime_error("Cannot write " + file_ + ": " + strerror(errno));
-    }
-  }
-  void Pad(size_t size) {
-    static const char zeros[kTarBlock] = {};
-    Write(zeros, (kTarBlock - size % kTarBlock) % kTarBlock);
-  }
-
   std::string file_;
   std::FILE* out_;
 };
@@ -952,7 +909,7 @@ struct PackageSet::TileEntry {
   uint64_t real = 0;             // real tile base
   size_t offset = 0, size = 0;   // position in the package tar
   uint32_t copy = 0, tileid = 0; // copy index and tile id of this package's copy
-  // position in the overlay; size 0 when the join left the tile as it is
+  // position of the tile's patch in the overlay file; size 0 when the join left the tile as it is
   size_t overlay_offset = 0, overlay_size = 0;
 
   // the package's own tile, over the read-only mapping of its tar
@@ -962,7 +919,7 @@ struct PackageSet::TileEntry {
   mutable std::once_flag grid_once;
   mutable double grid_cell = 0;
   mutable std::vector<uint32_t> grid;
-  // the tile as served from the overlay
+  // the tile as patched from the overlay
   mutable std::once_flag overlay_once;
   mutable graph_tile_ptr overlay_tile;
   mutable std::atomic<bool> counted{false};
@@ -980,13 +937,13 @@ struct PackageSet::Package {
   uint64_t fingerprint = 0; // of the tile tar
   std::string tile_extract;
   std::shared_ptr<midgard::tar> tar; // read-only mapping
-  std::unique_ptr<OpenFile> file;    // the mapped tar, for the private mapping; runtime join only
+  std::unique_ptr<OpenFile> file;    // the mapped tar, for the private mapping of rewritten tiles
   size_t tile_count = 0;
-  std::unique_ptr<TileEntry[]> tiles;           // in real tile id order
-  std::unordered_map<uint64_t, uint32_t> index; // real tile base -> index in tiles
-  std::unordered_map<uint64_t, TileRefs> refs;  // bake-time tile reference index; may be empty
-  std::shared_ptr<midgard::tar> overlay;        // when the set serves overlays
-  mutable std::once_flag private_once;          // the private mapping, made on first rewrite
+  std::unique_ptr<TileEntry[]> tiles;               // in real tile id order
+  std::unordered_map<uint64_t, uint32_t> index;     // real tile base -> index in tiles
+  std::unordered_map<uint64_t, TileRefs> refs;      // bake-time tile reference index; may be empty
+  std::shared_ptr<const std::vector<char>> overlay; // when the set serves overlays
+  mutable std::once_flag private_once;              // the private mapping, made on first rewrite
   mutable std::shared_ptr<PrivateMap> private_map;
   mutable std::mutex warned_mutex; // tiles the package references but does not ship, warned of
   mutable std::unordered_set<uint64_t> warned;
@@ -1206,90 +1163,91 @@ void PackageSet::IndexCopies() {
 
 void PackageSet::OpenOverlays(const std::string& dir) {
   const auto ids = CopyIds();
-  // (package, tile index, offset, size) of every overlay tile, applied once all overlays match
+  // (package, tile index, offset, size) of every patch, applied once all overlays match
   std::vector<std::tuple<uint32_t, uint32_t, size_t, size_t>> tiles;
-  std::vector<std::shared_ptr<midgard::tar>> overlays;
+  std::vector<std::shared_ptr<const std::vector<char>>> overlays;
   const auto stale = [&](const std::string& file, const std::string& why) {
     LOG_WARN("Overlay {} {}: joining packages at runtime", file, why);
   };
   for (uint32_t p = 0; p < packages_.size(); ++p) {
     const auto& package = *packages_[p];
     const auto file = (std::filesystem::path(dir) / (package.name + kOverlaySuffix)).string();
-    std::shared_ptr<midgard::tar> overlay;
+    std::shared_ptr<std::vector<char>> overlay;
     try {
       if (!std::filesystem::exists(file)) {
         stale(file, "is missing");
         return;
       }
-      overlay = std::make_shared<midgard::tar>(file);
+      std::ifstream in(file, std::ios::binary);
+      overlay = std::make_shared<std::vector<char>>(std::filesystem::file_size(file));
+      if (!in.read(overlay->data(), static_cast<std::streamsize>(overlay->size()))) {
+        throw std::runtime_error(strerror(errno));
+      }
     } catch (const std::exception& e) {
       stale(file, std::string("cannot be read (") + e.what() + ")");
       return;
     }
-    const char* base = overlay->mm.get();
+    const char* data = overlay->data();
+    const size_t size = overlay->size();
     std::string why;
-    bool first = true;
-    uint64_t expected_tiles = 0, expected_bytes = 0, found_tiles = 0, found_bytes = 0;
-    overlay->for_each([&](const std::string& name, const char* data, size_t size) {
-      if (size > overlay->mm.size() - static_cast<size_t>(data - base)) {
+    uint64_t tile_count = 0;
+    if (size < kOverlayHeaderSize || GetLE(data, 4) != kOverlayMagic ||
+        GetLE(data + 4, 4) != kOverlayVersion) {
+      why = "is not an overlay of this format";
+    } else if (GetLE(data + 8, 8) != join_key_) {
+      why = "was written for other packages";
+    } else if (GetLE(data + kOverlayIdCountOffset, 4) != ids.size()) {
+      why = "was written with other copy ids";
+    } else {
+      tile_count = GetLE(data + kOverlayTileCountOffset, 4);
+      const size_t directory = kOverlayHeaderSize + kOverlayIdSize * ids.size();
+      if (size < directory || tile_count > (size - directory) / kOverlayDirectorySize) {
         why = "is truncated";
-        first = false;
-        return false;
-      }
-      if (first) {
-        first = false;
-        if (name != kJoinEntry || size < kJoinEntryIdsOffset + 4 || GetLE(data, 4) != kOverlayMagic ||
-            GetLE(data + 4, 4) != kOverlayVersion) {
-          why = "is not an overlay of this format";
-        } else if (GetLE(data + 8, 8) != join_key_) {
-          why = "was written for other packages";
-        } else if (GetLE(data + kJoinEntryIdsOffset, 4) != ids.size() ||
-                   size != kJoinEntryIdsOffset + 4 + 16 * ids.size()) {
-          why = "was written with other copy ids";
-        } else {
-          for (size_t i = 0; i < ids.size() && why.empty(); ++i) {
-            const char* id = data + kJoinEntryIdsOffset + 4 + 16 * i;
-            const CopyId stored{static_cast<uint32_t>(GetLE(id, 4)),
-                                static_cast<uint32_t>(GetLE(id + 4, 4)),
-                                static_cast<uint32_t>(GetLE(id + 8, 4)),
-                                static_cast<uint32_t>(GetLE(id + 12, 4))};
-            if (!(stored == ids[i])) {
-              why = "was written with other copy ids";
-            }
-          }
-          expected_tiles = GetLE(data + kJoinEntryCountOffset, 4);
-          expected_bytes = GetLE(data + kJoinEntryBytesOffset, 8);
+      } else {
+        Hasher hasher;
+        hasher.Bytes(data + kOverlayHeaderSize, size - kOverlayHeaderSize);
+        if (hasher.value() != GetLE(data + kOverlayHashOffset, 8)) {
+          why = "is damaged";
         }
-        return why.empty();
       }
-      GraphId real;
-      try {
-        real = GraphId::FromTilePath(name);
-      } catch (const std::exception&) {
-        why = "has an unknown entry " + name;
-        return false;
+      for (size_t i = 0; i < ids.size() && why.empty(); ++i) {
+        const char* id = data + kOverlayHeaderSize + kOverlayIdSize * i;
+        const CopyId stored{static_cast<uint32_t>(GetLE(id, 4)),
+                            static_cast<uint32_t>(GetLE(id + 4, 4)),
+                            static_cast<uint32_t>(GetLE(id + 8, 4)),
+                            static_cast<uint32_t>(GetLE(id + 12, 4))};
+        if (!(stored == ids[i])) {
+          why = "was written with other copy ids";
+        }
       }
-      const auto found = package.index.find(real.value);
-      if (found == package.index.end() || size < sizeof(GraphTileHeader)) {
-        why = "has a tile the package does not have: " + name;
-        return false;
+    }
+    if (why.empty()) {
+      const size_t directory = kOverlayHeaderSize + kOverlayIdSize * ids.size();
+      const size_t patches = directory + kOverlayDirectorySize * tile_count;
+      uint64_t previous = 0, expected_offset = 0;
+      for (uint64_t t = 0; t < tile_count && why.empty(); ++t) {
+        const char* at = data + directory + kOverlayDirectorySize * t;
+        const GraphId real(GetLE(at, 4));
+        const size_t offset = GetLE(at + 4, 4), patch_size = GetLE(at + 8, 4);
+        const auto found = package.index.find(real.value);
+        if (t > 0 && real.value <= previous) {
+          why = "has its tiles out of order";
+        } else if (found == package.index.end()) {
+          why = "has a tile the package does not have: " + std::to_string(real);
+        } else if (offset != expected_offset || patch_size > size - patches - offset ||
+                   patch_size < 8) {
+          why = "is truncated";
+        } else if (GetLE(data + patches + offset, 4) != package.tiles[found->second].size) {
+          why = "has a patch for a tile of another size: " + std::to_string(real);
+        } else {
+          tiles.emplace_back(p, found->second, patches + offset, patch_size);
+          previous = real.value;
+          expected_offset = offset + patch_size;
+        }
       }
-      const auto& entry = package.tiles[found->second];
-      GraphTileHeader header;
-      std::memcpy(&header, data, sizeof(header));
-      if (header.graphid() != GraphId(entry.tileid, real.level(), 0) || header.end_offset() != size) {
-        why = "has a tile of other copy ids: " + name;
-        return false;
+      if (why.empty() && patches + expected_offset != size) {
+        why = "has trailing bytes";
       }
-      tiles.emplace_back(p, found->second, static_cast<size_t>(data - base), size);
-      ++found_tiles;
-      found_bytes += size;
-      return true;
-    });
-    if (first) {
-      why = "is empty";
-    } else if (why.empty() && (found_tiles != expected_tiles || found_bytes != expected_bytes)) {
-      why = "is incomplete";
     }
     if (!why.empty()) {
       stale(file, why);
@@ -1304,7 +1262,6 @@ void PackageSet::OpenOverlays(const std::string& dir) {
   }
   for (uint32_t p = 0; p < packages_.size(); ++p) {
     packages_[p]->overlay = std::move(overlays[p]);
-    packages_[p]->file.reset(); // nothing is rewritten
   }
   overlays_ = true;
   LOG_INFO("Serving {} packages from the overlays in {}", packages_.size(), dir);
@@ -1835,6 +1792,29 @@ private:
   std::vector<int> owners_;
 };
 
+TileWords PackageSet::Layout(const GraphTile& tile) {
+  static_assert(sizeof(NodeTransition) == 8 && sizeof(GraphId) == 8,
+                "Tile patches count transitions and bin entries in 8-byte words");
+  const auto* header = tile.header_;
+  const char* base = reinterpret_cast<const char*>(header);
+  // a region in words from the start of the tile; an unaligned region is left out of the patch's
+  // classes, and its changes go into the general one
+  const auto region = [&](const void* start, size_t count, size_t& first, size_t& words) {
+    const auto offset = static_cast<size_t>(reinterpret_cast<const char*>(start) - base);
+    if (offset % 8 == 0) {
+      first = offset / 8;
+      words = count;
+    }
+  };
+  TileWords layout;
+  region(tile.transitions_, header->transitioncount(), layout.transitions_first,
+         layout.transitions_count);
+  region(tile.directededges_, header->directededgecount(), layout.edges_first, layout.edges_count);
+  region(tile.edge_bins_, header->bin_offset(kBinCount - 1).second, layout.bins_first,
+         layout.bins_count);
+  return layout;
+}
+
 void PackageSet::Rewrite(uint32_t pkg, GraphTile& tile, Work work) const {
   GraphTileHeader* header = tile.header_;
   const GraphId real_base = header->graphid();
@@ -2094,11 +2074,30 @@ graph_tile_ptr PackageSet::LoadTile(const GraphId& tile_base) const {
       return entry.raw;
     }
     std::call_once(entry.overlay_once, [&]() {
-      const char* data = package.overlay->mm.get() + entry.overlay_offset;
-      entry.overlay_tile =
-          GraphTile::Create(GraphId(entry.tileid, real.level(), 0),
-                            std::make_unique<MappedTileMemory<midgard::tar>>(package.overlay, data,
-                                                                             entry.overlay_size));
+      if (entry.state == TileEntry::State::kBroken) {
+        throw std::runtime_error("Tile " + std::to_string(real) + " of package " + package.name +
+                                 " could not be patched");
+      }
+      const char* patch = package.overlay->data() + entry.overlay_offset;
+      try {
+        // the patch is applied inside the package's private mapping: only the pages it changes
+        // become private memory
+        std::call_once(package.private_once,
+                       [&]() { package.private_map = std::make_shared<PrivateMap>(*package.file); });
+        entry.overlay_tile =
+            GraphTile::Create(GraphId(entry.tileid, real.level(), 0),
+                              std::make_unique<MappedTileMemory<PrivateMap>>(package.private_map,
+                                                                             package.private_map
+                                                                                     ->data +
+                                                                                 entry.offset,
+                                                                             entry.size));
+        // the layout is read from the tile as the package built it; the patch then changes it
+        ApplyTilePatch(patch, entry.overlay_size, package.private_map->data + entry.offset,
+                       entry.size, Layout(*entry.overlay_tile));
+      } catch (...) {
+        entry.state = TileEntry::State::kBroken;
+        throw;
+      }
       ++counters_.overlay_tiles;
     });
     return entry.overlay_tile;
@@ -2174,30 +2173,13 @@ PackageSet::JoinReport PackageSet::WriteOverlays(const boost::property_tree::ptr
   std::filesystem::create_directories(dir);
   std::vector<std::pair<std::string, std::string>> files; // (partial, final)
   try {
-    // every package's overlay is open from the start; its first entry is patched with the tile
-    // count and bytes once its last tile is written
-    std::vector<std::unique_ptr<TarWriter>> outs;
+    // the patches of every package, in tile order, written once all are made
+    std::vector<std::vector<std::pair<uint32_t, TilePatch>>> patches(set->packages_.size());
     std::vector<Overlay> overlays;
     for (uint32_t pkg = 0; pkg < set->packages_.size(); ++pkg) {
       const auto& package = *set->packages_[pkg];
       const auto file = (std::filesystem::path(dir) / (package.name + kOverlaySuffix)).string();
       files.emplace_back(file + ".partial", file);
-      outs.push_back(std::make_unique<TarWriter>(files.back().first));
-      std::string join;
-      PutU32(join, kOverlayMagic);
-      PutU32(join, kOverlayVersion);
-      PutU64(join, set->join_key_);
-      PutU32(join, 0); // tile count, patched below
-      PutU32(join, 0);
-      PutU64(join, 0); // tile bytes, patched below
-      PutU32(join, static_cast<uint32_t>(ids.size()));
-      for (const auto& c : ids) {
-        PutU32(join, c.level);
-        PutU32(join, c.tileid);
-        PutU32(join, c.copy);
-        PutU32(join, c.id);
-      }
-      outs.back()->Add(kJoinEntry, join.data(), join.size());
       overlays.push_back(Overlay{package.name});
 #if defined(POSIX_FADV_SEQUENTIAL)
       posix_fadvise(package.file->fd(), 0, 0, POSIX_FADV_SEQUENTIAL);
@@ -2205,17 +2187,16 @@ PackageSet::JoinReport PackageSet::WriteOverlays(const boost::property_tree::ptr
     }
 
     // The tiles that need work, package by package in tile order. They are rewritten on
-    // `threads` threads, each into a heap buffer read from its tar, and written here in this
-    // order, so the overlays don't depend on the thread count. At most a window of tiles is in
-    // flight, and the packages' mapped pages are dropped every kReleaseBytes: memory stays bounded
-    // by a few tiles per thread.
+    // `threads` threads, each into a heap buffer read from its tar, and their patches are
+    // collected here in this order, so the overlays don't depend on the thread count. At most a
+    // window of tiles is in flight, and the packages' mapped pages are dropped every
+    // kReleaseBytes: memory stays bounded by a few tiles per thread.
     struct Job {
       uint32_t pkg;
       size_t tile;
       Work work;
     };
     std::vector<Job> jobs;
-    std::vector<size_t> last_job(set->packages_.size(), 0); // one past each package's last job
     for (uint32_t pkg = 0; pkg < set->packages_.size(); ++pkg) {
       const auto& package = *set->packages_[pkg];
       for (size_t i = 0; i < package.tile_count; ++i) {
@@ -2226,22 +2207,12 @@ PackageSet::JoinReport PackageSet::WriteOverlays(const boost::property_tree::ptr
           jobs.push_back({pkg, i, work});
         }
       }
-      last_job[pkg] = jobs.size();
     }
-    // a package's overlay is complete once its last tile is written
-    const auto end_overlay = [&](uint32_t pkg) {
-      std::string count, bytes;
-      PutU32(count, static_cast<uint32_t>(overlays[pkg].tiles));
-      PutU64(bytes, overlays[pkg].bytes);
-      outs[pkg]->Patch(kJoinEntryCountOffset, count);
-      outs[pkg]->Patch(kJoinEntryBytesOffset, bytes);
-      outs[pkg]->End();
-    };
-
-    // a rewritten tile, or why it couldn't be
+    // the patch of a rewritten tile (empty when the join left its bytes as they were), or why it
+    // couldn't be made
     struct Done {
-      bool ready = false, changed = false;
-      std::vector<char> tile;
+      bool ready = false;
+      TilePatch patch;
       std::exception_ptr error;
     };
     const size_t window = 2 * threads;
@@ -2275,10 +2246,8 @@ PackageSet::JoinReport PackageSet::WriteOverlays(const boost::property_tree::ptr
           ++(job.work == Work::kFull ? set->counters_.full_rewrites : set->counters_.id_rewrites);
           const auto* joined = reinterpret_cast<const char*>(tile->header());
           // only tiles whose bytes changed go into the overlay
-          result.changed = std::memcmp(joined, original.data(), entry.size) != 0;
-          if (result.changed) {
-            result.tile.assign(joined, joined + entry.size);
-          }
+          result.patch =
+              MakeTilePatch(original.data(), joined, entry.size, Layout(*tile), kPatchLevel);
         } catch (...) {
           result.error = std::current_exception();
         }
@@ -2307,14 +2276,7 @@ PackageSet::JoinReport PackageSet::WriteOverlays(const boost::property_tree::ptr
         workers.emplace_back(rewrite);
       }
       size_t read = 0;
-      uint32_t open_pkg = 0; // packages before it are complete
-      const auto end_until = [&](size_t k) {
-        for (; open_pkg < set->packages_.size() && last_job[open_pkg] <= k; ++open_pkg) {
-          end_overlay(open_pkg);
-        }
-      };
       for (size_t k = 0; k < jobs.size(); ++k) {
-        end_until(k);
         Done result;
         {
           std::unique_lock<std::mutex> lock(mutex);
@@ -2327,11 +2289,8 @@ PackageSet::JoinReport PackageSet::WriteOverlays(const boost::property_tree::ptr
         }
         const auto& job = jobs[k];
         const auto& entry = set->packages_[job.pkg]->tiles[job.tile];
-        if (result.changed) {
-          outs[job.pkg]->Add(GraphTile::FileSuffix(GraphId(entry.real)), result.tile.data(),
-                             entry.size);
-          ++overlays[job.pkg].tiles;
-          overlays[job.pkg].bytes += entry.size;
+        if (!result.patch.bytes.empty()) {
+          patches[job.pkg].emplace_back(static_cast<uint32_t>(entry.real), std::move(result.patch));
         }
         read += entry.size;
         if (read >= kReleaseBytes) {
@@ -2344,7 +2303,6 @@ PackageSet::JoinReport PackageSet::WriteOverlays(const boost::property_tree::ptr
         }
         room.notify_all();
       }
-      end_until(jobs.size());
       join_workers();
     } catch (...) {
       join_workers();
@@ -2352,6 +2310,45 @@ PackageSet::JoinReport PackageSet::WriteOverlays(const boost::property_tree::ptr
     }
     // durable before any is renamed into place; syncing them together lets the writes of one
     // package overlap the work on the next
+    std::vector<std::unique_ptr<DurableFile>> outs;
+    for (uint32_t pkg = 0; pkg < set->packages_.size(); ++pkg) {
+      std::string directory, blobs, file;
+      Hasher content;
+      for (const auto& [tile, patch] : patches[pkg]) {
+        PutU32(directory, tile);
+        PutU32(directory, static_cast<uint32_t>(blobs.size()));
+        PutU32(directory, static_cast<uint32_t>(patch.bytes.size()));
+        blobs += patch.bytes;
+        content.U64(tile);
+        content.U64(patch.content_hash);
+        if (blobs.size() > std::numeric_limits<uint32_t>::max()) {
+          throw std::runtime_error("The overlay of " + set->packages_[pkg]->name + " is too large");
+        }
+      }
+      for (const auto& c : ids) {
+        PutU32(file, c.level);
+        PutU32(file, c.tileid);
+        PutU32(file, c.copy);
+        PutU32(file, c.id);
+      }
+      file += directory;
+      file += blobs;
+      Hasher hasher;
+      hasher.Bytes(file.data(), file.size());
+      std::string header;
+      PutU32(header, kOverlayMagic);
+      PutU32(header, kOverlayVersion);
+      PutU64(header, set->join_key_);
+      PutU32(header, static_cast<uint32_t>(patches[pkg].size()));
+      PutU32(header, static_cast<uint32_t>(ids.size()));
+      PutU64(header, hasher.value());
+      file.insert(0, header);
+      outs.push_back(std::make_unique<DurableFile>(files[pkg].first));
+      outs.back()->Write(file);
+      overlays[pkg].tiles = patches[pkg].size();
+      overlays[pkg].bytes = file.size();
+      overlays[pkg].content_hash = content.value();
+    }
     for (auto& out : outs) {
       out->Sync();
     }

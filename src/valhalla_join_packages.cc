@@ -65,7 +65,8 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < report.overlays.size(); ++i) {
       const auto& overlay = report.overlays[i];
       std::cout << (i ? ", " : "") << "\"" << overlay.name << "\": {\"tiles\": " << overlay.tiles
-                << ", \"bytes\": " << overlay.bytes << "}";
+                << ", \"bytes\": " << overlay.bytes << ", \"content_hash\": \"" << std::hex
+                << overlay.content_hash << std::dec << "\"}";
     }
     std::cout << "}}" << std::endl;
   } catch (const std::exception& e) {

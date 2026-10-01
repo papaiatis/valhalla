@@ -996,6 +996,35 @@ TEST_F(SplitJoin, OverlaysDependOnlyOnThePackageSet) {
   EXPECT_TRUE(served->uses_overlays());
 }
 
+// The overlays are written by several threads, in tile order: the thread count changes how long a
+// join takes and nothing it writes.
+TEST_F(SplitJoin, OverlaysDoNotDependOnTheThreadCount) {
+  const auto base = std::string(VALHALLA_BUILD_DIR "test/data/gurka_packages/split/threads");
+  fs::remove_all(base);
+  auto config = maps_.joined.config.get_child("mjolnir");
+  std::map<size_t, PackageSet::JoinReport> reports;
+  for (const size_t threads : {1u, 2u, 7u, 64u}) {
+    config.put("concurrency", threads);
+    reports[threads] = PackageSet::WriteOverlays(config, base + "/" + std::to_string(threads));
+  }
+  for (const auto& [threads, report] : reports) {
+    EXPECT_EQ(report.key, reports.at(1).key) << threads << " threads";
+    EXPECT_EQ(report.stats.joined, reports.at(1).stats.joined) << threads << " threads";
+    EXPECT_EQ(report.stats.lost, reports.at(1).stats.lost) << threads << " threads";
+    for (const auto& package : maps_.packages) {
+      const auto expected = ReadFile(OverlayFile(base + "/1", package.name));
+      EXPECT_FALSE(expected.empty());
+      EXPECT_TRUE(ReadFile(OverlayFile(base + "/" + std::to_string(threads), package.name)) ==
+                  expected)
+          << package.name << " with " << threads << " threads";
+    }
+  }
+  // the golden overlays are the ones a multi-threaded join writes too
+  const auto served = PackageSet::FromConfig(
+      WithOverlays(maps_.joined, base + "/7").config.get_child("mjolnir"));
+  EXPECT_TRUE(served->uses_overlays());
+}
+
 TEST_F(SplitJoin, TileRefsMustMatchTheirTar) {
   const auto& west = maps_.packages[0];
   const auto& east = maps_.packages[1];
@@ -1196,6 +1225,118 @@ TEST(SixPackages, HoldingOneTileLoadAndRoute) {
   EXPECT_NEAR(RouteKm(map, "A", "M"), Km(layout, "A", "M"), 0.01);
   EXPECT_NEAR(RouteKm(map, "M", "A"), Km(layout, "M", "A"), 0.01);
   ExpectConsistentGraph(reader);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Three packages, west, middle, and east, along one road, all in one level-2 tile. Each owns a run
+// of nodes and is built from the ways within one node of its box, so west and east reach into
+// middle's box without meeting each other.
+
+class ThreePackages : public ::testing::Test {
+protected:
+  static void SetUpTestSuite() {
+    const std::string ascii = R"(
+      A--B--C--D--E--F--G--H--I--J--K--L--M
+    )";
+    layout_ = gurka::detail::map_to_coordinates(ascii, 100, {5.1, 52.1});
+    for (size_t i = 0; i + 1 < kNodes.size(); ++i) {
+      ways_[kNodes.substr(i, 2)] = {{"highway", "residential"}};
+    }
+    ways_ = WithWayIds(ways_);
+    const std::string dir = VALHALLA_BUILD_DIR "test/data/gurka_packages/three";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    single_ = gurka::buildtiles(layout_, ways_, {}, {}, dir + "/single");
+    const double spacing = Lng(1) - Lng(0);
+    const auto build = [&](const std::string& name, size_t first, size_t last, double min_lng,
+                           double max_lng) {
+      const double min = Lng(first) - spacing / 2, max = Lng(last) + spacing / 2;
+      return BuildPackage(dir, name, layout_,
+                          WaysWithin(ways_, layout_, min - spacing, max + spacing), {},
+                          {min_lng ? min_lng : min, 51.0, max_lng ? max_lng : max, 53.0});
+    };
+    const auto west = build("west", 0, 3, 4.0, 0);
+    const auto middle = build("middle", 4, 8, 0, 0);
+    const auto east = build("east", 9, 12, 0, 6.0);
+    without_middle_ = PackageMap({west, east}, dir + "/without_middle", layout_);
+    all_ = PackageMap({west, middle, east}, dir + "/all", layout_);
+  }
+
+  static double Lng(size_t i) { return layout_.at(std::string(1, kNodes[i])).lng(); }
+
+  static const std::string kNodes;
+  static gurka::nodelayout layout_;
+  static gurka::ways ways_;
+  static gurka::map single_, without_middle_, all_;
+};
+const std::string ThreePackages::kNodes = "ABCDEFGHIJKLM";
+gurka::nodelayout ThreePackages::layout_;
+gurka::ways ThreePackages::ways_;
+gurka::map ThreePackages::single_, ThreePackages::without_middle_, ThreePackages::all_;
+
+TEST_F(ThreePackages, DeletingOneEqualsASetThatNeverHadIt) {
+  // the same routes with all three packages installed, so the test can tell the sets apart
+  for (const auto& map : {without_middle_, all_}) {
+    for (const auto& [from, to] : {std::make_pair("A", "D"), std::make_pair("D", "A"),
+                                   std::make_pair("J", "M"), std::make_pair("M", "J")}) {
+      const auto expected = Route(single_, from, to);
+      const auto actual = Route(map, from, to);
+      EXPECT_EQ(actual.edges, expected.edges) << from << " -> " << to;
+      EXPECT_NEAR(actual.seconds, expected.seconds, 1e-3) << from << " -> " << to;
+    }
+  }
+  GraphReader reader(without_middle_.config.get_child("mjolnir"));
+  ExpectConsistentGraph(reader);
+}
+
+TEST_F(ThreePackages, BorderRoadsEndWithTheRemainingData) {
+  // F is west's last node and lies in middle's box
+  EXPECT_NEAR(RouteKm(without_middle_, "A", "F"), Km(layout_, "A", "F"), 0.01);
+  EXPECT_NEAR(RouteKm(without_middle_, "F", "A"), Km(layout_, "F", "A"), 0.01);
+  EXPECT_THROW(RouteKm(without_middle_, "A", "M"), std::exception);
+  EXPECT_THROW(RouteKm(without_middle_, "M", "A"), std::exception);
+  // with middle installed, the same trip goes through
+  EXPECT_NEAR(RouteKm(all_, "A", "M"), Km(layout_, "A", "M"), 0.01);
+}
+
+// ---------------------------------------------------------------------------------------------
+// An outer package around the whole map and a newer inner one inside it, like a country and a
+// region of it.
+
+TEST(NestedPackages, DeletingTheInnerGivesTheAreaBack) {
+  const std::string ascii = R"(
+    A--B--C--D--E--F--G
+  )";
+  const auto layout = gurka::detail::map_to_coordinates(ascii, 100, {5.1, 52.1});
+  gurka::ways ways;
+  const std::string nodes = "ABCDEFG";
+  for (size_t i = 0; i + 1 < nodes.size(); ++i) {
+    ways[nodes.substr(i, 2)] = {{"highway", "residential"}};
+  }
+  ways = WithWayIds(ways);
+  const std::string dir = VALHALLA_BUILD_DIR "test/data/gurka_packages/nested";
+  fs::remove_all(dir);
+  fs::create_directories(dir);
+  const auto single = gurka::buildtiles(layout, ways, {}, {}, dir + "/single");
+
+  const double spacing = layout.at("B").lng() - layout.at("A").lng();
+  const double min = layout.at("C").lng() - spacing / 2, max = layout.at("E").lng() + spacing / 2;
+  const auto outer = BuildPackage(dir, "outer", layout, ways, {}, {4.0, 51.0, 6.0, 53.0}, 1);
+  const auto inner = BuildPackage(dir, "inner", layout,
+                                  WaysWithin(ways, layout, min - spacing, max + spacing), {},
+                                  {min, 51.0, max, 53.0}, 2);
+
+  const auto both = PackageMap({outer, inner}, dir + "/both", layout);
+  const auto set = PackageSet::FromConfig(both.config.get_child("mjolnir"));
+  const auto owner = [&](const std::string& node) { return set->name(set->Owner(layout.at(node))); };
+  EXPECT_EQ(owner("D"), "inner");
+  EXPECT_EQ(owner("A"), "outer");
+
+  const auto outer_alone = PackageMap({outer}, dir + "/outer_alone", layout);
+  const auto expected = Route(single, "C", "E");
+  const auto actual = Route(outer_alone, "C", "E");
+  EXPECT_EQ(actual.edges, expected.edges);
+  EXPECT_NEAR(actual.seconds, expected.seconds, 1e-3);
 }
 
 // ---------------------------------------------------------------------------------------------

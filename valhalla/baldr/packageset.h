@@ -9,6 +9,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <shared_mutex>
 #include <string>
@@ -50,6 +51,11 @@ private:
   std::unordered_map<int64_t, std::vector<uint32_t>> cells_;
   // Row bands of kCellDeg degrees -> segment indices overlapping the band (for ray casting).
   std::unordered_map<int32_t, std::vector<uint32_t>> rows_;
+  // Range of the cells that hold segments.
+  int32_t row_min_ = std::numeric_limits<int32_t>::max();
+  int32_t row_max_ = std::numeric_limits<int32_t>::min();
+  int32_t col_min_ = std::numeric_limits<int32_t>::max();
+  int32_t col_max_ = std::numeric_limits<int32_t>::min();
 
   static int32_t Row(double lat);
   static int32_t Col(double lng);
@@ -241,8 +247,10 @@ private:
 
   // Rewrites a tile of package pkg in place, doing the given work.
   void Rewrite(uint32_t pkg, GraphTile& tile, Work work) const;
+  // Owners of the nodes of the tile being rewritten, found once per node.
+  class NodeOwners;
   // The kFull part of Rewrite: joins or disables the edges of a tile with the given real id.
-  void JoinEdges(uint32_t pkg, GraphTile& tile, const GraphId& real_base) const;
+  void JoinEdges(uint32_t pkg, GraphTile& tile, const GraphId& real_base, NodeOwners& owners) const;
   // An edge id of a complex restriction of package pkg, as the copy routes use: the copy of the
   // package owning its start node.
   GraphId RestrictionEdge(uint32_t pkg, const GraphId& real) const;

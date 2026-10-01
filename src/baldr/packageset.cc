@@ -14,13 +14,16 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <tuple>
 #include <unordered_set>
 
@@ -195,6 +198,10 @@ RegionPolygon::RegionPolygon(const std::string& poly_file) {
     bbox_.Expand(s.b);
     const int32_t r0 = Row(std::min(s.a.lat(), s.b.lat())), r1 = Row(std::max(s.a.lat(), s.b.lat()));
     const int32_t c0 = Col(std::min(s.a.lng(), s.b.lng())), c1 = Col(std::max(s.a.lng(), s.b.lng()));
+    row_min_ = std::min(row_min_, r0);
+    row_max_ = std::max(row_max_, r1);
+    col_min_ = std::min(col_min_, c0);
+    col_max_ = std::max(col_max_, c1);
     for (int32_t r = r0; r <= r1; ++r) {
       rows_[r].push_back(i);
       for (int32_t c = c0; c <= c1; ++c) {
@@ -243,19 +250,31 @@ double RegionPolygon::Distance(const PointLL& p) const {
       }
     }
   };
+  // cells outside the range of the index hold no segment, so a ring is visited only where it
+  // overlaps the range: far from the polygon, most of a ring is outside it
+  const auto visit_row = [&](int32_t r, int32_t c0, int32_t c1) {
+    if (r >= row_min_ && r <= row_max_) {
+      for (int32_t c = std::max(c0, col_min_); c <= std::min(c1, col_max_); ++c) {
+        visit(r, c);
+      }
+    }
+  };
+  const auto visit_col = [&](int32_t c, int32_t r0, int32_t r1) {
+    if (c >= col_min_ && c <= col_max_) {
+      for (int32_t r = std::max(r0, row_min_); r <= std::min(r1, row_max_); ++r) {
+        visit(r, c);
+      }
+    }
+  };
   for (int32_t ring = 0; ring <= kMaxDistanceRings; ++ring) {
     // only the ring's perimeter: its interior was visited by the smaller rings
     if (ring == 0) {
-      visit(row, col);
+      visit_row(row, col, col);
     } else {
-      for (int32_t c = col - ring; c <= col + ring; ++c) {
-        visit(row - ring, c);
-        visit(row + ring, c);
-      }
-      for (int32_t r = row - ring + 1; r <= row + ring - 1; ++r) {
-        visit(r, col - ring);
-        visit(r, col + ring);
-      }
+      visit_row(row - ring, col - ring, col + ring);
+      visit_row(row + ring, col - ring, col + ring);
+      visit_col(col - ring, row - ring + 1, row + ring - 1);
+      visit_col(col + ring, row - ring + 1, row + ring - 1);
     }
     // everything outside this ring is at least ring cells away
     if (best <= ring * min_cell_m) {
@@ -379,6 +398,27 @@ public:
 
   int fd() const {
     return fd_;
+  }
+  // Reads size bytes at offset.
+  void Read(char* data, size_t size, size_t offset) const {
+    while (size > 0) {
+#ifdef _WIN32
+      const auto n = _lseeki64(fd_, static_cast<__int64>(offset), SEEK_SET) < 0
+                         ? -1
+                         : _read(fd_, data, static_cast<unsigned>(std::min<size_t>(size, 1u << 30)));
+#else
+      const ssize_t n = pread(fd_, data, size, static_cast<off_t>(offset));
+      if (n < 0 && errno == EINTR) {
+        continue;
+      }
+#endif
+      if (n <= 0) {
+        throw std::runtime_error(file_ + " (read): " + (n < 0 ? strerror(errno) : "unexpected end"));
+      }
+      data += n;
+      size -= static_cast<size_t>(n);
+      offset += static_cast<size_t>(n);
+    }
   }
   size_t size() const {
     return size_;
@@ -794,15 +834,20 @@ public:
     }
   }
 
-  // Ends the archive and makes it durable.
-  void Finish() {
+  // Ends the archive; Sync makes it durable.
+  void End() {
     const std::vector<char> end(2 * kTarBlock, 0);
     Write(end.data(), end.size());
-    bool ok = std::fflush(out_) == 0;
+    if (std::fflush(out_) != 0) {
+      throw std::runtime_error("Cannot write " + file_ + ": " + strerror(errno));
+    }
+  }
+
+  void Sync() {
 #ifdef _WIN32
-    ok = ok && _commit(_fileno(out_)) == 0;
+    bool ok = _commit(_fileno(out_)) == 0;
 #else
-    ok = ok && fsync(fileno(out_)) == 0;
+    bool ok = fsync(fileno(out_)) == 0;
 #endif
     ok = std::fclose(out_) == 0 && ok;
     out_ = nullptr;
@@ -1767,12 +1812,36 @@ GraphId PackageSet::RestrictionEdge(uint32_t pkg, const GraphId& real) const {
   return Nowhere(real);
 }
 
+// The owners of the nodes of one tile, each found once: a node is asked for as the start of its
+// edges and as the end of the edges that reach it, and the bins ask for the start nodes again.
+class PackageSet::NodeOwners {
+public:
+  NodeOwners(const PackageSet& set, const GraphTile& tile)
+      : set_(set), tile_(tile), owners_(tile.header()->nodecount(), kUnknown) {
+  }
+
+  int Of(uint32_t node) {
+    int& owner = owners_[node];
+    if (owner == kUnknown) {
+      owner = set_.FindOwner(tile_.node(node)->latlng(tile_.header()->base_ll()));
+    }
+    return owner;
+  }
+
+private:
+  static constexpr int kUnknown = std::numeric_limits<int>::min();
+  const PackageSet& set_;
+  const GraphTile& tile_;
+  std::vector<int> owners_;
+};
+
 void PackageSet::Rewrite(uint32_t pkg, GraphTile& tile, Work work) const {
   GraphTileHeader* header = tile.header_;
   const GraphId real_base = header->graphid();
   GraphTileHeader new_header = *header;
   new_header.set_graphid(Virtual(pkg, real_base));
   Store(*header, new_header);
+  std::optional<NodeOwners> owners; // full rewrites only
 
   if (work == Work::kIdsOnly) {
     // every edge stays as it is, only end nodes in other tiles move to our slots
@@ -1783,7 +1852,8 @@ void PackageSet::Rewrite(uint32_t pkg, GraphTile& tile, Work work) const {
       Store(target, edge);
     }
   } else if (work == Work::kFull) {
-    JoinEdges(pkg, tile, real_base);
+    owners.emplace(*this, tile);
+    JoinEdges(pkg, tile, real_base, *owners);
   }
 
   for (uint32_t t = 0; t < header->transitioncount(); ++t) {
@@ -1799,6 +1869,12 @@ void PackageSet::Rewrite(uint32_t pkg, GraphTile& tile, Work work) const {
       if (work != Work::kFull) {
         // lighter work already knows every binned edge starts at a node of ours
         Store(id, Virtual(pkg, id));
+      } else if (id.tile_base() == real_base) {
+        // EdgeOwned, with the owners already found for this tile's nodes
+        const int64_t node =
+            id.id() < header->directededgecount() ? StartNode(tile, id.id()) : int64_t{-1};
+        const bool owned = node >= 0 && owners->Of(static_cast<uint32_t>(node)) == static_cast<int>(pkg);
+        Store(id, owned ? Virtual(pkg, id) : GraphId());
       } else if (!RawTile(pkg, id.tile_base())) {
         WarnMissingTile(pkg, id.tile_base());
         Store(id, GraphId());
@@ -1828,7 +1904,10 @@ void PackageSet::Rewrite(uint32_t pkg, GraphTile& tile, Work work) const {
                      remap);
 }
 
-void PackageSet::JoinEdges(uint32_t pkg, GraphTile& tile, const GraphId& real_base) const {
+void PackageSet::JoinEdges(uint32_t pkg,
+                           GraphTile& tile,
+                           const GraphId& real_base,
+                           NodeOwners& owners) const {
   const GraphTileHeader* header = tile.header_;
   const auto base_ll = header->base_ll();
   const int self = static_cast<int>(pkg);
@@ -1847,17 +1926,35 @@ void PackageSet::JoinEdges(uint32_t pkg, GraphTile& tile, const GraphId& real_ba
   const int tile_owner = BoxOwner(TileHierarchy::GetGraphIdBoundingBox(real_base));
   const bool check_foreign_edges = !ReachesOnlyForeign(pkg, real_base.value, tile_owner);
 
+  // NodeLL and FindOwner of an edge's end node; this tile's nodes come from the owners found
+  const auto end_node = [&](const GraphId& end_real, PointLL& end, int& owner) {
+    if (end_real.tile_base() != real_base) {
+      if (!NodeLL(pkg, end_real, end)) {
+        return false;
+      }
+      owner = FindOwner(end);
+      return true;
+    }
+    if (end_real.id() >= header->nodecount()) {
+      return false;
+    }
+    end = tile.node(end_real.id())->latlng(base_ll);
+    owner = owners.Of(end_real.id());
+    return true;
+  };
+
   uint64_t disabled = 0, joined = 0, lost = 0;
   for (uint32_t n = 0; n < header->nodecount(); ++n) {
     const NodeInfo* node = tile.node(n);
     const PointLL start = node->latlng(base_ll);
-    if (FindOwner(start) != self) {
+    if (owners.Of(n) != self) {
       disabled += node->edge_count();
       for (uint32_t k = 0; check_foreign_edges && k < node->edge_count(); ++k) {
         DirectedEdge& target = tile.directededges_[node->edge_index() + k];
         PointLL end;
+        int end_owner = 0;
         if ((tile_owner != kUndecided && !target.leaves_tile()) ||
-            !NodeLL(pkg, target.endnode(), end) || FindOwner(end) != self) {
+            !end_node(target.endnode(), end, end_owner) || end_owner != self) {
           continue;
         }
         DirectedEdge edge = target;
@@ -1879,7 +1976,8 @@ void PackageSet::JoinEdges(uint32_t pkg, GraphTile& tile, const GraphId& real_ba
         edge.set_not_thru(false);
       }
       PointLL end;
-      if (!NodeLL(pkg, end_real, end)) {
+      int end_owner = 0;
+      if (!end_node(end_real, end, end_owner)) {
         // the package does not have the end node: keep the edge out of routing
         if (RawTile(pkg, end_real.tile_base())) {
           LOG_WARN("Package {} edge {} ends at missing node {}", packages_[pkg]->name,
@@ -1892,7 +1990,6 @@ void PackageSet::JoinEdges(uint32_t pkg, GraphTile& tile, const GraphId& real_ba
         Store(target, edge);
         continue;
       }
-      const int end_owner = FindOwner(end);
       if (end_owner == self) {
         Store(target, edge);
         continue;
@@ -2068,16 +2165,24 @@ PackageSet::JoinReport PackageSet::WriteOverlays(const boost::property_tree::ptr
   set->IndexCopies();
   const auto ids = set->CopyIds();
 
+  // mjolnir.concurrency, the thread count of Valhalla's other tools, defaults to every core
+  const size_t threads = std::max<size_t>(
+      1, pt.get<size_t>("concurrency", std::max(1u, std::thread::hardware_concurrency())));
+
   JoinReport report;
   report.key = set->join_key_;
   std::filesystem::create_directories(dir);
   std::vector<std::pair<std::string, std::string>> files; // (partial, final)
   try {
+    // every package's overlay is open from the start; its first entry is patched with the tile
+    // count and bytes once its last tile is written
+    std::vector<std::unique_ptr<TarWriter>> outs;
+    std::vector<Overlay> overlays;
     for (uint32_t pkg = 0; pkg < set->packages_.size(); ++pkg) {
       const auto& package = *set->packages_[pkg];
       const auto file = (std::filesystem::path(dir) / (package.name + kOverlaySuffix)).string();
       files.emplace_back(file + ".partial", file);
-      TarWriter out(files.back().first);
+      outs.push_back(std::make_unique<TarWriter>(files.back().first));
       std::string join;
       PutU32(join, kOverlayMagic);
       PutU32(join, kOverlayVersion);
@@ -2092,45 +2197,165 @@ PackageSet::JoinReport PackageSet::WriteOverlays(const boost::property_tree::ptr
         PutU32(join, c.copy);
         PutU32(join, c.id);
       }
-      out.Add(kJoinEntry, join.data(), join.size());
+      outs.back()->Add(kJoinEntry, join.data(), join.size());
+      overlays.push_back(Overlay{package.name});
+#if defined(POSIX_FADV_SEQUENTIAL)
+      posix_fadvise(package.file->fd(), 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+    }
 
-      // One tile at a time, into a heap buffer: the packages stay mapped read-only, and their
-      // pages are dropped every kReleaseBytes, so memory stays bounded by a few tiles.
-      Overlay overlay{package.name};
-      size_t read = 0;
+    // The tiles that need work, package by package in tile order. They are rewritten on
+    // `threads` threads, each into a heap buffer read from its tar, and written here in this
+    // order, so the overlays don't depend on the thread count. At most a window of tiles is in
+    // flight, and the packages' mapped pages are dropped every kReleaseBytes: memory stays bounded
+    // by a few tiles per thread.
+    struct Job {
+      uint32_t pkg;
+      size_t tile;
+      Work work;
+    };
+    std::vector<Job> jobs;
+    std::vector<size_t> last_job(set->packages_.size(), 0); // one past each package's last job
+    for (uint32_t pkg = 0; pkg < set->packages_.size(); ++pkg) {
+      const auto& package = *set->packages_[pkg];
       for (size_t i = 0; i < package.tile_count; ++i) {
-        const auto& entry = package.tiles[i];
-        const Work work = set->ComputeWork(pkg, entry);
+        const Work work = set->ComputeWork(pkg, package.tiles[i]);
         if (work == Work::kNone) {
           ++set->counters_.clean_tiles;
-          continue;
+        } else {
+          jobs.push_back({pkg, i, work});
         }
-        const auto* original =
-            reinterpret_cast<const char*>(set->RawTile(pkg, GraphId(entry.real))->header());
-        auto tile = GraphTile::Create(GraphId(entry.real),
-                                      std::vector<char>(original, original + entry.size));
-        set->Rewrite(pkg, const_cast<GraphTile&>(*tile), work);
-        ++(work == Work::kFull ? set->counters_.full_rewrites : set->counters_.id_rewrites);
-        const auto* joined = reinterpret_cast<const char*>(tile->header());
-        if (std::memcmp(joined, original, entry.size) != 0) {
-          out.Add(GraphTile::FileSuffix(GraphId(entry.real)), joined, entry.size);
-          ++overlay.tiles;
-          overlay.bytes += entry.size;
+      }
+      last_job[pkg] = jobs.size();
+    }
+    // a package's overlay is complete once its last tile is written
+    const auto end_overlay = [&](uint32_t pkg) {
+      std::string count, bytes;
+      PutU32(count, static_cast<uint32_t>(overlays[pkg].tiles));
+      PutU64(bytes, overlays[pkg].bytes);
+      outs[pkg]->Patch(kJoinEntryCountOffset, count);
+      outs[pkg]->Patch(kJoinEntryBytesOffset, bytes);
+      outs[pkg]->End();
+    };
+
+    // a rewritten tile, or why it couldn't be
+    struct Done {
+      bool ready = false, changed = false;
+      std::vector<char> tile;
+      std::exception_ptr error;
+    };
+    const size_t window = 2 * threads;
+    std::vector<Done> done(jobs.size());
+    std::mutex mutex;
+    std::condition_variable ready, room;
+    size_t next = 0, written = 0;
+    bool stop = false;
+    const auto rewrite = [&]() {
+      for (;;) {
+        size_t k;
+        {
+          std::unique_lock<std::mutex> lock(mutex);
+          room.wait(lock, [&] { return stop || next >= jobs.size() || next < written + window; });
+          if (stop || next >= jobs.size()) {
+            return;
+          }
+          k = next++;
+        }
+        Done result;
+        try {
+          const auto& job = jobs[k];
+          const auto& package = *set->packages_[job.pkg];
+          const auto& entry = package.tiles[job.tile];
+          // pread, not the mapping: the tiles come in file order, so the reads are sequential,
+          // while faulting the mapping in reads the file a few pages at a time
+          std::vector<char> original(entry.size);
+          package.file->Read(original.data(), entry.size, entry.offset);
+          auto tile = GraphTile::Create(GraphId(entry.real), std::vector<char>(original));
+          set->Rewrite(job.pkg, const_cast<GraphTile&>(*tile), job.work);
+          ++(job.work == Work::kFull ? set->counters_.full_rewrites : set->counters_.id_rewrites);
+          const auto* joined = reinterpret_cast<const char*>(tile->header());
+          // only tiles whose bytes changed go into the overlay
+          result.changed = std::memcmp(joined, original.data(), entry.size) != 0;
+          if (result.changed) {
+            result.tile.assign(joined, joined + entry.size);
+          }
+        } catch (...) {
+          result.error = std::current_exception();
+        }
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          result.ready = true;
+          done[k] = std::move(result);
+        }
+        ready.notify_all();
+      }
+    };
+    std::vector<std::thread> workers;
+    const auto join_workers = [&]() {
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        stop = true;
+      }
+      room.notify_all();
+      for (auto& worker : workers) {
+        worker.join();
+      }
+      workers.clear();
+    };
+    try {
+      for (size_t t = 0; t < std::min(threads, jobs.size()); ++t) {
+        workers.emplace_back(rewrite);
+      }
+      size_t read = 0;
+      uint32_t open_pkg = 0; // packages before it are complete
+      const auto end_until = [&](size_t k) {
+        for (; open_pkg < set->packages_.size() && last_job[open_pkg] <= k; ++open_pkg) {
+          end_overlay(open_pkg);
+        }
+      };
+      for (size_t k = 0; k < jobs.size(); ++k) {
+        end_until(k);
+        Done result;
+        {
+          std::unique_lock<std::mutex> lock(mutex);
+          ready.wait(lock, [&] { return done[k].ready; });
+          result = std::move(done[k]);
+          done[k] = Done{};
+        }
+        if (result.error) {
+          std::rethrow_exception(result.error);
+        }
+        const auto& job = jobs[k];
+        const auto& entry = set->packages_[job.pkg]->tiles[job.tile];
+        if (result.changed) {
+          outs[job.pkg]->Add(GraphTile::FileSuffix(GraphId(entry.real)), result.tile.data(),
+                             entry.size);
+          ++overlays[job.pkg].tiles;
+          overlays[job.pkg].bytes += entry.size;
         }
         read += entry.size;
         if (read >= kReleaseBytes) {
           set->ReleasePages();
           read = 0;
         }
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          written = k + 1;
+        }
+        room.notify_all();
       }
-      std::string count, bytes;
-      PutU32(count, static_cast<uint32_t>(overlay.tiles));
-      PutU64(bytes, overlay.bytes);
-      out.Patch(kJoinEntryCountOffset, count);
-      out.Patch(kJoinEntryBytesOffset, bytes);
-      out.Finish();
-      report.overlays.push_back(overlay);
+      end_until(jobs.size());
+      join_workers();
+    } catch (...) {
+      join_workers();
+      throw;
     }
+    // durable before any is renamed into place; syncing them together lets the writes of one
+    // package overlap the work on the next
+    for (auto& out : outs) {
+      out->Sync();
+    }
+    report.overlays = std::move(overlays);
     // all overlays are complete: a reader sees the old ones or the new ones, and a mix of both
     // has different join keys, which falls back to the runtime join
     for (const auto& [partial, file] : files) {

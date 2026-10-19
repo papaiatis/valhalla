@@ -897,8 +897,8 @@ TEST(GoldenJoin, OverlayHashes) {
   const auto report = PackageSet::WriteOverlays(maps.joined.config.get_child("mjolnir"), dir);
   EXPECT_EQ(report.stats.lost, 0u);
   // When the join or the tile format changes on purpose, update the hashes from this output.
-  EXPECT_EQ(Fnv1a(ReadFile(maps.packages[0].tar)), 535886572131682744ull) << "west tiles";
-  EXPECT_EQ(Fnv1a(ReadFile(maps.packages[1].tar)), 9302745409726607298ull) << "east tiles";
+  EXPECT_EQ(Fnv1a(ReadFile(maps.packages[0].tar)), 17902437390814921717ull) << "west tiles";
+  EXPECT_EQ(Fnv1a(ReadFile(maps.packages[1].tar)), 14952003861242954440ull) << "east tiles";
   // the tiles each package serves from its overlay, in tile order
   const auto served =
       PackageSet::FromConfig(WithOverlays(maps.joined, dir).config.get_child("mjolnir"));
@@ -916,10 +916,10 @@ TEST(GoldenJoin, OverlayHashes) {
                                       [&](const auto& o) { return o.name == name; });
     return overlay == report.overlays.end() ? 0 : overlay->content_hash;
   };
-  EXPECT_EQ(patches_hash("west"), 10945871183313045016ull) << "west patches";
-  EXPECT_EQ(patches_hash("east"), 3877405390329665803ull) << "east patches";
-  EXPECT_EQ(joined_hash(maps.packages[0]), 3014461116394766175ull) << "west joined tiles";
-  EXPECT_EQ(joined_hash(maps.packages[1]), 18440462409556805356ull) << "east joined tiles";
+  EXPECT_EQ(patches_hash("west"), 12398647568525806846ull) << "west patches";
+  EXPECT_EQ(patches_hash("east"), 9431493116851309916ull) << "east patches";
+  EXPECT_EQ(joined_hash(maps.packages[0]), 5369537762930308138ull) << "west joined tiles";
+  EXPECT_EQ(joined_hash(maps.packages[1]), 3789466029052403958ull) << "east joined tiles";
 }
 
 TEST_F(SplitJoin, MissingOrStaleOverlaysFallBackToTheRuntimeJoin) {

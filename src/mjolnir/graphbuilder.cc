@@ -540,6 +540,7 @@ void BuildTileSet(const std::string& ways_file,
   auto database = pt.get_optional<std::string>("admin");
   bool use_urban_tag = pt.get<bool>("data_processing.use_urban_tag", false);
   bool use_admin_db = pt.get<bool>("data_processing.use_admin_db", true);
+  bool driving_side_fallback = pt.get<bool>("data_processing.driving_side_fallback", false);
 
   // Initialize the admin DB (if it exists)
   auto admin_db = (database && use_admin_db) ? AdminDB::open(*database) : std::optional<AdminDB>{};
@@ -724,7 +725,8 @@ void BuildTileSet(const std::string& ways_file,
             std::swap(source, target);
           }
 
-          if (!use_admin_db)
+          // outside every admin the way knows best
+          if (!use_admin_db || (driving_side_fallback && admin_index == 0))
             dor = w.drive_on_right();
 
           // Speed values are already clamped to kMaxAssumedSpeed (140) in OSMWay setters.

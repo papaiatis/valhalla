@@ -184,12 +184,13 @@ struct graph_parser {
     use_urban_tag_ = pt.get<bool>("data_processing.use_urban_tag", false);
     use_rest_area_ = pt.get<bool>("data_processing.use_rest_area", false);
     use_admin_db_ = pt.get<bool>("data_processing.use_admin_db", true);
+    driving_side_fallback_ = pt.get<bool>("data_processing.driving_side_fallback", false);
 
     empty_node_tags_ = lua_.Transform(OSMType::kNode, 0, {});
     empty_relation_tags_ = lua_.Transform(OSMType::kRelation, 0, {});
 
     tag_handlers_["driving_side"] = [this]() {
-      if (!use_admin_db_) {
+      if (!use_admin_db_ || driving_side_fallback_) {
         way_.set_drive_on_right(tag_.second == "right" ? true : false);
       }
     };
@@ -5078,6 +5079,10 @@ struct graph_parser {
   // Configuration option indicating whether or not to process the admin iso code keys on the
   // nodes during the parsing phase or to get the admin info from the admin db
   bool use_admin_db_;
+
+  // Configuration option indicating whether or not the driving_side key on the ways is kept for
+  // nodes that the admin db does not cover
+  bool driving_side_fallback_;
 
   // Road class assignment needs to be set to the highway cutoff for ferries and auto trains.
   RoadClass highway_cutoff_rc_;

@@ -1,4 +1,5 @@
 #include "gurka.h"
+#include "test.h"
 #include "mjolnir/adminbuilder.h"
 #include "mjolnir/util.h"
 
@@ -553,4 +554,63 @@ TEST(AdminTest, PartialRelationKeepsItsClosedRing) {
   // no ring can be built from a relation with no way in the extract
   EXPECT_EQ(rows.count("Hollowland"), 0u);
   EXPECT_EQ(rows.at("Akrotiri and Dhekelia"), "GB");
+}
+
+TEST(AdminTest, DrivingSideOutsideEveryAdmin) {
+  const std::string ascii_map = R"(
+    P-------Q
+    |  A-B  |
+    S-------R
+
+    E---F---G
+
+    H---I---J
+  )";
+  const gurka::ways ways = {
+      {"PQRSP", {}},
+      {"AB", {{"highway", "primary"}}},
+      {"EF", {{"highway", "primary"}}},
+      {"FG", {{"highway", "primary"}}},
+      {"HI", {{"highway", "primary"}, {"driving_side", "left"}}},
+      {"IJ", {{"highway", "primary"}, {"driving_side", "left"}}},
+  };
+  const gurka::relations relations = {
+      {{{gurka::way_member, "PQRSP", "outer"}},
+       {{"type", "boundary"},
+        {"boundary", "administrative"},
+        {"admin_level", "2"},
+        {"name", "Japan"},
+        {"ISO3166-1", "JP"}}},
+  };
+
+  const std::string workdir = "test/data/admin_driving_side";
+  std::filesystem::remove_all(workdir);
+  std::filesystem::create_directories(workdir);
+  const auto layout = gurka::detail::map_to_coordinates(ascii_map, 100000);
+  detail::build_pbf(layout, ways, {}, relations, workdir + "/map.pbf", false);
+
+  gurka::map map;
+  map.nodes = layout;
+  map.config = test::make_config(workdir,
+                                  {{"mjolnir.admin", workdir + "/admin.sqlite"},
+                                   {"mjolnir.timezone", workdir + "/not_needed.sqlite"},
+                                   {"mjolnir.data_processing.driving_side_fallback", "true"}});
+  const std::vector<std::string> input = {workdir + "/map.pbf"};
+  ASSERT_TRUE(BuildAdminFromPBF(map.config.get_child("mjolnir"), input));
+  build_tile_set(map.config, input, mjolnir::BuildStage::kInitialize, mjolnir::BuildStage::kValidate);
+
+  GraphReader reader(map.config.get_child("mjolnir"));
+  const auto drive_on_right = [&](const std::string& way, const std::string& end) {
+    GraphId edge_id, reverse_id;
+    const DirectedEdge *edge = nullptr, *reverse = nullptr;
+    std::tie(edge_id, edge, reverse_id, reverse) = findEdge(reader, map.nodes, way, end);
+    EXPECT_NE(edge, nullptr);
+    const auto node_id = edge->endnode();
+    return reader.GetGraphTile(node_id)->node(node_id)->drive_on_right();
+  };
+  // inside the polygon: the polygon's value
+  EXPECT_FALSE(drive_on_right("AB", "B"));
+  // outside every polygon: the way's own side, right unless tagged
+  EXPECT_TRUE(drive_on_right("EF", "F"));
+  EXPECT_FALSE(drive_on_right("HI", "I"));
 }

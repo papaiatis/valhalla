@@ -196,7 +196,7 @@ function rels_proc (kv, nokeys)
        elseif kv["ISO3166-1"] then
          kv["iso_code"] = kv["ISO3166-1"]
        end
-       if kv["name"] == "British Sovereign Base Areas" and kv["iso_code"] == nil then
+       if (kv["name"] == "British Sovereign Base Areas" or kv["name"] == "Akrotiri and Dhekelia") and kv["iso_code"] == nil then
          kv["iso_code"] = "GB"
        end
      elseif kv["admin_level"] == "4" then

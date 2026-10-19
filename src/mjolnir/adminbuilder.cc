@@ -180,6 +180,8 @@ void buffer_polygon(const bg::polygon_ll_t& polygon, bg::multipolygon_ll_t& mult
  * @param outer        whether or not we should build a lookup for outers or inners
  * @param lines        ring segments that are built as output to be later connected together
  * @param line_lookup  a look up to find ring segments to help in connecting them together
+ * @param skip_missing whether a member way that is not in the input is skipped instead of failing
+ * @param missing      counts the member ways that were skipped
  * @return true if all the members of the relation had corresponding geometry
  */
 bool to_segments(const OSMAdminData& admin_data,
@@ -187,7 +189,9 @@ bool to_segments(const OSMAdminData& admin_data,
                  const std::string& name,
                  bool outer,
                  std::vector<bg::ring_ll_t>& lines,
-                 std::unordered_multimap<valhalla::midgard::PointLL, size_t>& line_lookup) {
+                 std::unordered_multimap<valhalla::midgard::PointLL, size_t>& line_lookup,
+                 bool skip_missing,
+                 size_t& missing) {
   // get all the individual members of the admin relation merged into one ring
   auto role_itr = admin.roles.begin();
   for (const auto memberid : admin.ways) {
@@ -199,6 +203,10 @@ bool to_segments(const OSMAdminData& admin_data,
     // Example:  PA extract can contain an NY relation but wont have all its members
     auto w_itr = admin_data.way_map.find(memberid);
     if (w_itr == admin_data.way_map.end()) {
+      if (skip_missing) {
+        ++missing;
+        continue;
+      }
       LOG_WARN(name + " (" + std::to_string(admin.id) + ") is missing way member " +
                std::to_string(memberid));
       return false;
@@ -235,13 +243,17 @@ bool to_segments(const OSMAdminData& admin_data,
  * @param line_lookup a multi map that lets one easily find a line segment by its first or last point
  * @param rings       a place to put the finally formed rings
  * @param inners      a place to put any inners that occur from self intersection corrections
+ * @param dropped     counts the chains of lines that did not close into a ring
+ * @param quiet       whether to leave the open chains out of the log
  * @return zero or more rings
  */
 void to_rings(const std::pair<std::string, uint64_t>& admin_info,
               std::vector<bg::ring_ll_t>& lines,
               std::unordered_multimap<valhalla::midgard::PointLL, size_t>& line_lookup,
               std::vector<bg::ring_ll_t>& rings,
-              std::vector<bg::ring_ll_t>& inners) {
+              std::vector<bg::ring_ll_t>& inners,
+              size_t& dropped,
+              bool quiet) {
 
   // keep going while we have threads to pull
   while (!line_lookup.empty()) {
@@ -274,9 +286,12 @@ void to_rings(const std::pair<std::string, uint64_t>& admin_info,
 
     // degenerate rings are ignored, unconnected rings or missing relation members cause this
     if (ring.size() < 4 || ring.front() != ring.back()) {
-      LOG_WARN("Degenerate ring for " + admin_info.first + " (" + std::to_string(admin_info.second) +
-               ")  near lat,lon " + std::to_string(ring.back().y()) + "," +
-               std::to_string(ring.back().x()));
+      ++dropped;
+      if (!quiet) {
+        LOG_WARN("Degenerate ring for " + admin_info.first + " (" +
+                 std::to_string(admin_info.second) + ")  near lat,lon " +
+                 std::to_string(ring.back().y()) + "," + std::to_string(ring.back().x()));
+      }
       continue;
     }
 
@@ -498,6 +513,9 @@ bool BuildAdminFromPBF(const boost::property_tree::ptree& pt,
   // initialize geos
   geos_helper_t::get();
 
+  // whether the closed rings of a relation with missing member ways are kept
+  const bool allow_partial = pt.get<bool>("data_processing.allow_partial_admin_relations", false);
+
   // for each admin area (relation)
   [[maybe_unused]] uint32_t count = 0;
   for (const auto& admin : admin_data.admins) {
@@ -507,17 +525,27 @@ bool BuildAdminFromPBF(const boost::property_tree::ptree& pt,
 
     // do inners and outers separately
     bool complete = true;
+    size_t missing = 0, dropped = 0;
     std::array<std::vector<bg::ring_ll_t>, 2> outers_inners;
     for (bool outer : {true, false}) {
       // grab the ring segments and a lookup to find them when connecting them
       std::vector<bg::ring_ll_t> lines;
       std::unordered_multimap<valhalla::midgard::PointLL, size_t> line_lookup;
-      if (!to_segments(admin_data, admin, admin_info.first, outer, lines, line_lookup)) {
+      if (!to_segments(admin_data, admin, admin_info.first, outer, lines, line_lookup, allow_partial,
+                       missing)) {
         complete = false;
         break;
       }
       // connect them into a series of one or more rings
-      to_rings(admin_info, lines, line_lookup, outers_inners[!outer], outers_inners[1]);
+      to_rings(admin_info, lines, line_lookup, outers_inners[!outer], outers_inners[1], dropped,
+               allow_partial);
+    }
+
+    if (missing && !outers_inners.front().empty()) {
+      LOG_WARN(admin_info.first + " (" + std::to_string(admin_info.second) + ") was built from " +
+               std::to_string(outers_inners.front().size()) + " outer rings, " +
+               std::to_string(dropped) + " open chains were dropped, " + std::to_string(missing) +
+               " member ways are missing");
     }
 
     // if we didn't have a complete relation (ie some members were missing) we bail

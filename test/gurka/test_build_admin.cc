@@ -6,6 +6,7 @@
 #include <sqlite3.h>
 
 #include <filesystem>
+#include <map>
 
 using namespace valhalla;
 using namespace valhalla::baldr;
@@ -469,4 +470,87 @@ TEST(AdminTest, TestBuildAdminFromPBF) {
     EXPECT_EQ(one_admin.state_text(), "None");
     EXPECT_EQ(one_admin.country_text(), "None");
   }
+}
+
+namespace {
+
+// name -> iso_code ("" when null) of the country rows of an admin database built from a relation
+// set that includes incomplete relations
+std::map<std::string, std::string> BuildPartialAdmins(bool allow_partial) {
+  const std::string ascii_map = R"(
+    P-------Q       a-------b
+    |       |       |       |
+    S-------R       d-------c
+  )";
+  const gurka::ways ways = {{"PQRSP", {}}, {"abcda", {}}};
+  const auto outer = [](const std::string& way) {
+    return gurka::relation_member{gurka::way_member, way, "outer"};
+  };
+  const auto level2 = [](const std::string& name, const std::string& iso = "") {
+    std::map<std::string, std::string> tags = {{"type", "boundary"},
+                                               {"boundary", "administrative"},
+                                               {"admin_level", "2"},
+                                               {"name", name}};
+    if (!iso.empty()) {
+      tags["ISO3166-1"] = iso;
+    }
+    return tags;
+  };
+  const gurka::relations relations = {
+      // a closed ring plus a way that is not in the extract
+      {{outer("PQRSP"), outer("zz")}, level2("Partialia", "PA")},
+      // none of the ways is in the extract
+      {{outer("yy"), outer("xx")}, level2("Hollowland", "HO")},
+      // a closed ring and no ISO code
+      {{outer("abcda")}, level2("Akrotiri and Dhekelia")},
+  };
+
+  const std::string workdir = "test/data/admin_partial";
+  std::filesystem::remove_all(workdir);
+  std::filesystem::create_directories(workdir);
+  detail::build_pbf(gurka::detail::map_to_coordinates(ascii_map, 100000), ways, {}, relations,
+                    workdir + "/map.pbf", false);
+
+  boost::property_tree::ptree pt;
+  pt.put("admin", workdir + "/admin.sqlite");
+  pt.put("concurrency", 1);
+  pt.put("id_table_size", 1000);
+  pt.put("data_processing.allow_partial_admin_relations", allow_partial);
+  EXPECT_TRUE(BuildAdminFromPBF(pt, {workdir + "/map.pbf"}));
+
+  sqlite3* db = nullptr;
+  EXPECT_EQ(sqlite3_open_v2((workdir + "/admin.sqlite").c_str(), &db, SQLITE_OPEN_READONLY, nullptr),
+            SQLITE_OK);
+  std::map<std::string, std::string> rows;
+  sqlite3_stmt* stmt = nullptr;
+  EXPECT_EQ(sqlite3_prepare_v2(db, "SELECT name, iso_code FROM admins WHERE admin_level = 2", -1,
+                               &stmt, nullptr),
+            SQLITE_OK);
+  while (sqlite3_step(stmt) == SQLITE_ROW) {
+    const auto* iso = sqlite3_column_text(stmt, 1);
+    rows[reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0))] =
+        iso ? reinterpret_cast<const char*>(iso) : "";
+  }
+  sqlite3_finalize(stmt);
+  sqlite3_close(db);
+  return rows;
+}
+
+} // anonymous namespace
+
+TEST(AdminTest, IncompleteRelationIsSkippedByDefault) {
+  const auto rows = BuildPartialAdmins(false);
+  EXPECT_EQ(rows.count("Partialia"), 0u);
+  EXPECT_EQ(rows.count("Hollowland"), 0u);
+  // the rule for Akrotiri and Dhekelia does not depend on the key
+  EXPECT_EQ(rows.at("Akrotiri and Dhekelia"), "GB");
+}
+
+TEST(AdminTest, PartialRelationKeepsItsClosedRing) {
+  const auto rows = BuildPartialAdmins(true);
+  ASSERT_EQ(rows.count("Partialia"), 1u);
+  EXPECT_EQ(rows.at("Partialia"), "PA");
+  // no ring can be built from a relation with no way in the extract
+  EXPECT_EQ(rows.count("Hollowland"), 0u);
+  EXPECT_EQ(rows.at("Akrotiri and Dhekelia"), "GB");
 }

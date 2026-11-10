@@ -491,6 +491,11 @@ void loki_worker_t::check_hierarchy_distance(Api& request) {
     }
   } else {
     auto locations = options.locations();
+    // Nothing to measure without at least two locations (trace actions carry a shape instead);
+    // the loop below would otherwise step before the start of an empty list.
+    if (locations.size() < 2) {
+      return;
+    }
     float arc_distance = 0.0f;
     for (auto source = locations.begin(); source != locations.end() - 1; ++source) {
       arc_distance += to_ll(*source).Distance(to_ll(*(source + 1)));

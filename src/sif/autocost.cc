@@ -360,6 +360,9 @@ AutoCost::AutoCost(const Costing& costing, uint32_t access_mask)
 
   // Get the base transition costs
   get_base_costs(costing);
+  // preferring unpaved removes the fixed unpaved penalty
+  if (paved_factor_ > 1.0f)
+    surface_factor_ = 0.0f;
 
   // Get alley factor from costing options.
   alley_factor_ = costing_options.alley_factor();
@@ -540,7 +543,7 @@ Cost AutoCost::EdgeCost(const baldr::DirectedEdge* edge,
       break;
   }
 
-  factor *= EdgeFactor(edgeid);
+  factor *= EdgeFactor(edgeid) * PreferenceFactor(edge);
 
   if (IsClosed(edge, tile)) {
     // Add a penalty for traversing a closed edge
@@ -549,7 +552,9 @@ Cost AutoCost::EdgeCost(const baldr::DirectedEdge* edge,
 
   // base cost before the factor is a linear combination of time vs distance, depending on which
   // one the user thinks is more important to them
-  return Cost((sec * inv_distance_factor_ + edge->length() * distance_factor_) * factor, sec);
+  return Cost((sec * inv_distance_factor_ + edge->length() * distance_factor_) * factor +
+                  EdgePreferencePenalty(edge),
+              sec);
 }
 
 // Returns the time (in seconds) to make the transition from the predecessor
@@ -615,6 +620,7 @@ Cost AutoCost::TransitionCost(const baldr::DirectedEdge* edge,
 
   // Account for the user preferring distance
   c.cost *= inv_distance_factor_;
+  c.cost += TransitionPreferencePenalty(edge, pred.roundabout(), node);
 
   return c;
 }
@@ -687,6 +693,7 @@ Cost AutoCost::TransitionCostReverse(const uint32_t idx,
 
   // Account for the user preferring distance
   c.cost *= inv_distance_factor_;
+  c.cost += TransitionPreferencePenalty(edge, pred->roundabout(), node);
 
   return c;
 }

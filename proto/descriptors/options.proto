@@ -362,6 +362,20 @@ message Costing {
     oneof has_low_class_factor {
       float low_class_factor = 97;
     }
+    // route preference options (auto and motorcycle); they only add cost
+    reserved 100, 105, 107, 108, 109, 110, 114, 115;
+    float paved_factor = 98;       // factor on edges with a surface better than compacted
+    float straight_factor = 99;    // extra factor on edges with low curvature
+    bool skip_shortcuts = 101;     // the bidirectional search does not expand shortcut edges
+    float primary_factor = 102;    // road class weights (0 = unset = 1)
+    float secondary_factor = 103;
+    float tertiary_factor = 104;
+    float urban_factor = 106;      // extra factor on dense (urban) edges
+    float signal_penalty = 111;    // seconds of cost per traffic signal
+    float roundabout_penalty = 112; // seconds of cost per roundabout entry
+    float border_penalty = 113;    // seconds of cost per country crossing edge
+    float motorway_factor = 116;
+    float trunk_factor = 117;
   }
 
   oneof has_options {

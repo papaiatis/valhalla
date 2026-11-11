@@ -490,6 +490,8 @@ void ParseBaseCostOptions(const rapidjson::Value& json,
   co->set_disable_hierarchy_pruning(
       rapidjson::get<bool>(json, "/disable_hierarchy_pruning", co->disable_hierarchy_pruning()));
 
+  co->set_skip_shortcuts(rapidjson::get<bool>(json, "/skip_shortcuts", co->skip_shortcuts()));
+
   // hierarchy limits
   for (const auto& level : TileHierarchy::levels()) {
     std::string hierarchy_limits_path = "/hierarchy_limits/" + std::to_string(level.level);
@@ -544,6 +546,27 @@ void ParseBaseCostOptions(const rapidjson::Value& json,
   // country_crossing_penalty
   JSON_PBF_RANGED_DEFAULT(co, cfg.country_crossing_penalty_, json, "/country_crossing_penalty",
                           country_crossing_penalty, warnings);
+
+  // route preference options
+  JSON_PBF_RANGED_DEFAULT_V2(co, cfg.paved_factor_, json, "/paved_factor", paved_factor, warnings);
+  JSON_PBF_RANGED_DEFAULT_V2(co, cfg.straight_factor_, json, "/straight_factor", straight_factor,
+                             warnings);
+  JSON_PBF_RANGED_DEFAULT_V2(co, cfg.class_weight_, json, "/motorway_factor", motorway_factor,
+                             warnings);
+  JSON_PBF_RANGED_DEFAULT_V2(co, cfg.class_weight_, json, "/trunk_factor", trunk_factor, warnings);
+  JSON_PBF_RANGED_DEFAULT_V2(co, cfg.class_weight_, json, "/primary_factor", primary_factor,
+                             warnings);
+  JSON_PBF_RANGED_DEFAULT_V2(co, cfg.class_weight_, json, "/secondary_factor", secondary_factor,
+                             warnings);
+  JSON_PBF_RANGED_DEFAULT_V2(co, cfg.class_weight_, json, "/tertiary_factor", tertiary_factor,
+                             warnings);
+  JSON_PBF_RANGED_DEFAULT_V2(co, cfg.urban_factor_, json, "/urban_factor", urban_factor, warnings);
+  JSON_PBF_RANGED_DEFAULT_V2(co, cfg.signal_penalty_, json, "/signal_penalty", signal_penalty,
+                             warnings);
+  JSON_PBF_RANGED_DEFAULT_V2(co, cfg.roundabout_penalty_, json, "/roundabout_penalty",
+                             roundabout_penalty, warnings);
+  JSON_PBF_RANGED_DEFAULT_V2(co, cfg.border_penalty_, json, "/border_penalty", border_penalty,
+                             warnings);
 
   if (!cfg.disable_toll_booth_) {
     // toll_booth_cost

@@ -28,8 +28,6 @@ constexpr float kDefaultUseHighways = 0.5f; // Factor between 0 and 1
 constexpr float kDefaultUseTolls = 0.5f;    // Factor between 0 and 1
 constexpr float kDefaultUseTrails = 0.0f;   // Factor between 0 and 1
 
-constexpr Surface kMinimumMotorcycleSurface = Surface::kImpassable;
-
 // Default turn costs
 constexpr float kTCStraight = 0.5f;
 constexpr float kTCSlight = 0.75f;
@@ -364,9 +362,10 @@ bool MotorcycleCost::Allowed(const baldr::DirectedEdge* edge,
   // Allow U-turns at dead-end nodes.
   if (!IsAccessible(edge) || (!pred.deadend() && pred.opp_local_idx() == edge->localedgeidx()) ||
       ((pred.restrictions() & (1 << edge->localedgeidx())) && !ignore_turn_restrictions_) ||
-      (edge->surface() > kMinimumMotorcycleSurface) || IsUserAvoidEdge(edgeid) ||
+      edge->surface() == Surface::kImpassable || IsUserAvoidEdge(edgeid) ||
       (!allow_destination_only_ && !pred.destonly() && edge->destonly()) ||
-      (pred.closure_pruning() && IsClosed(edge, tile)) || CheckExclusions<true>(edge, pred)) {
+      (pred.closure_pruning() && IsClosed(edge, tile)) ||
+      (exclude_unpaved_ && !pred.unpaved() && edge->unpaved()) || CheckExclusions<true>(edge, pred)) {
     return false;
   }
 
@@ -393,9 +392,10 @@ bool MotorcycleCost::AllowedReverse(const baldr::DirectedEdge* edge,
   // Allow U-turns at dead-end nodes.
   if (!IsAccessible(opp_edge) || (!pred.deadend() && pred.opp_local_idx() == edge->localedgeidx()) ||
       ((opp_edge->restrictions() & (1 << pred.opp_local_idx())) && !ignore_turn_restrictions_) ||
-      (opp_edge->surface() > kMinimumMotorcycleSurface) || IsUserAvoidEdge(opp_edgeid) ||
+      opp_edge->surface() == Surface::kImpassable || IsUserAvoidEdge(opp_edgeid) ||
       (!allow_destination_only_ && !pred.destonly() && opp_edge->destonly()) ||
       (pred.closure_pruning() && IsClosed(opp_edge, tile)) ||
+      (exclude_unpaved_ && !pred.unpaved() && opp_edge->unpaved()) ||
       CheckExclusions<false>(opp_edge, pred)) {
     return false;
   }
@@ -451,9 +451,11 @@ Cost MotorcycleCost::EdgeCost(const baldr::DirectedEdge* edge,
     factor *= closure_factor_;
   }
 
-  factor *= EdgeFactor(edgeid);
+  factor *= EdgeFactor(edgeid) * PreferenceFactor(edge);
 
-  return Cost((sec * inv_distance_factor_ + edge->length() * distance_factor_) * factor, sec);
+  return Cost((sec * inv_distance_factor_ + edge->length() * distance_factor_) * factor +
+                  EdgePreferencePenalty(edge),
+              sec);
 }
 
 // Returns the time (in seconds) to make the transition from the predecessor
@@ -517,6 +519,7 @@ Cost MotorcycleCost::TransitionCost(const baldr::DirectedEdge* edge,
   }
 
   c.cost *= inv_distance_factor_;
+  c.cost += TransitionPreferencePenalty(edge, pred.roundabout(), node);
 
   return c;
 }
@@ -595,6 +598,7 @@ Cost MotorcycleCost::TransitionCostReverse(
   }
 
   c.cost *= inv_distance_factor_;
+  c.cost += TransitionPreferencePenalty(edge, pred->roundabout(), node);
 
   return c;
 }

@@ -22,6 +22,7 @@
 
 #include <boost/container/small_vector.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
@@ -1251,6 +1252,13 @@ public:
     project_on_bss_connection_ = project_on_bss_connection;
   };
 
+  /**
+   * Whether the bidirectional search must not expand shortcut edges (option skip_shortcuts).
+   */
+  bool SkipShortcuts() const {
+    return skip_shortcuts_;
+  }
+
 protected:
   /**
    * Returns the averaged factor for an edge fraction based on user provided custom factors
@@ -1386,6 +1394,56 @@ protected:
   // Whether or not to do shortest (by length) routes
   // Note: hierarchy pruning means some costings (auto, truck, etc) won't do absolute shortest
   bool shortest_;
+
+  // Route preference options. They only add cost: edge factors are >= 1 and penalties are >= 0, so
+  // the A* heuristic stays admissible. Penalties are in seconds, go to the cost only (not to
+  // Cost.secs) and are added after the use_distance scaling.
+  float paved_factor_ = 1.0f;    // factor on edges with a surface better than compacted
+  float straight_factor_ = 0.0f; // extra factor on edges with low curvature
+  float urban_factor_ = 0.0f;    // extra factor on dense (urban) edges
+  float class_factor_[8] = {1, 1, 1, 1, 1, 1, 1, 1}; // per RoadClass, weight / smallest weight
+  float signal_penalty_ = 0.0f;
+  float roundabout_penalty_ = 0.0f;
+  float border_penalty_ = 0.0f;
+  bool skip_shortcuts_ = false;
+
+  /**
+   * Cost factor (>= 1) of an edge from the route preference options.
+   */
+  float PreferenceFactor(const baldr::DirectedEdge* edge) const {
+    float f = class_factor_[static_cast<uint32_t>(edge->classification())];
+    if (paved_factor_ > 1.0f && edge->surface() < baldr::Surface::kCompacted)
+      f *= paved_factor_;
+    if (straight_factor_ > 0.0f)
+      f *= 1.0f + straight_factor_ * std::max(0.0f, 1.0f - edge->curvature() / 6.0f);
+    if (urban_factor_ > 0.0f)
+      f *= 1.0f + urban_factor_ * std::max(0.0f, edge->density() - 6.0f) / 9.0f;
+    return f;
+  }
+
+  /**
+   * Penalty (seconds of cost) on the edge itself: a signal in the middle of the edge and a country
+   * crossing. EdgeCost always gets the edge in travel direction (also in the reverse search), so the
+   * forward and the reverse search agree.
+   */
+  float EdgePreferencePenalty(const baldr::DirectedEdge* edge) const {
+    return (edge->traffic_signal() ? signal_penalty_ : 0.0f) +
+           (edge->ctry_crossing() ? border_penalty_ : 0.0f);
+  }
+
+  /**
+   * Penalty (seconds of cost) of a transition: a signal on the node and a roundabout edge that
+   * follows a non-roundabout edge. In the forward search pred_roundabout comes from the predecessor
+   * label; in the reverse search it comes from the pred directed edge (opp_edge), which is the edge
+   * before in travel direction.
+   */
+  float TransitionPreferencePenalty(const baldr::DirectedEdge* edge,
+                                    bool pred_roundabout,
+                                    const baldr::NodeInfo* node) const {
+    return ((edge->roundabout() && !pred_roundabout) ? roundabout_penalty_ : 0.0f) +
+           (node->traffic_signal() ? signal_penalty_ : 0.0f);
+  }
+
   float distance_factor_;     // How much distance factors in overall favorability
   float inv_distance_factor_; // How much time factors in overall favorability
 
@@ -1524,6 +1582,26 @@ protected:
         fixed_speed_ == baldr::kDisableFixedSpeed ? costing_options.top_speed() : fixed_speed_;
 
     exclude_unpaved_ = costing_options.exclude_unpaved();
+    paved_factor_ = std::max(1.0f, costing_options.paved_factor());
+    straight_factor_ = std::max(0.0f, costing_options.straight_factor());
+    urban_factor_ = std::max(0.0f, costing_options.urban_factor());
+    signal_penalty_ = std::max(0.0f, costing_options.signal_penalty());
+    roundabout_penalty_ = std::max(0.0f, costing_options.roundabout_penalty());
+    border_penalty_ = std::max(0.0f, costing_options.border_penalty());
+    skip_shortcuts_ = costing_options.skip_shortcuts();
+    {
+      // an unset (0) weight counts as 1; dividing by the smallest weight keeps every factor >= 1
+      auto weight = [](float v) { return v > 0.0f ? v : 1.0f; };
+      float w[8] = {1, 1, 1, 1, 1, 1, 1, 1};
+      w[static_cast<int>(baldr::RoadClass::kMotorway)] = weight(costing_options.motorway_factor());
+      w[static_cast<int>(baldr::RoadClass::kTrunk)] = weight(costing_options.trunk_factor());
+      w[static_cast<int>(baldr::RoadClass::kPrimary)] = weight(costing_options.primary_factor());
+      w[static_cast<int>(baldr::RoadClass::kSecondary)] = weight(costing_options.secondary_factor());
+      w[static_cast<int>(baldr::RoadClass::kTertiary)] = weight(costing_options.tertiary_factor());
+      const float smallest = *std::min_element(w, w + 8);
+      for (int i = 0; i < 8; ++i)
+        class_factor_[i] = w[i] / smallest;
+    }
     exclude_bridges_ = costing_options.exclude_bridges();
     exclude_tunnels_ = costing_options.exclude_tunnels();
     exclude_tolls_ = costing_options.exclude_tolls();
@@ -1617,6 +1695,15 @@ struct BaseCostingOptionsConfig {
   ranged_default_t<float> private_access_penalty_;
   ranged_default_t<float> country_crossing_cost_;
   ranged_default_t<float> country_crossing_penalty_;
+
+  // route preference options
+  ranged_default_t<float> paved_factor_{1.f, 1.f, 10.f};
+  ranged_default_t<float> straight_factor_{0.f, 0.f, 12.f};
+  ranged_default_t<float> class_weight_{0.1f, 1.f, 10.f}; // all five road class weights
+  ranged_default_t<float> urban_factor_{0.f, 0.f, 16.f};
+  ranged_default_t<float> signal_penalty_{0.f, 0.f, 43200.f};
+  ranged_default_t<float> roundabout_penalty_{0.f, 0.f, 43200.f};
+  ranged_default_t<float> border_penalty_{0.f, 0.f, 43200.f};
 
   bool disable_toll_booth_ = false;
   ranged_default_t<float> toll_booth_cost_;
